@@ -1,0 +1,16 @@
+services:
+  startpage:
+    build: .
+    image: startpage-server
+    container_name: startpage
+    ports:
+      - "8080:8080"
+    volumes:
+      - startpage-data:/data
+    restart: unless-stopped
+    # environment:
+    #   RESET_ADMIN: "1"   # one boot only: deletes the admin account (links are
+    #                      # parked and re-adopted at the next setup), then remove it.
+
+volumes:
+  startpage-data:

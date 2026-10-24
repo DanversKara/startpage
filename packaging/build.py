@@ -1,0 +1,103 @@
+"""Package the site as a New Tab browser extension.
+
+The extension ships the exact same index.html and src/ as the website —
+this script only adds a manifest and icons, then zips one package per store:
+
+    dist/bookmark-os-chrome-<ver>.zip      Chrome Web Store + Edge Add-ons
+    dist/bookmark-os-firefox-<ver>.zip     Firefox Add-ons (AMO)
+
+Each package is staged unpacked in build/<target>/ and kept there for
+"Load unpacked" / about:debugging testing.
+
+Run from anywhere:  python packaging/build.py
+"""
+import json
+import re
+import shutil
+import zipfile
+from pathlib import Path
+
+PACKAGING = Path(__file__).resolve().parent
+ROOT = PACKAGING.parent
+DIST  = ROOT / 'dist'
+BUILD = ROOT / 'build'
+
+# Firefox needs a stable add-on ID and, for new AMO listings, a declaration of
+# what data leaves the browser. This edition collects nothing: links come from
+# the user's own server via /api/sync (see below), so 'none' is declared.
+GECKO = {
+    'id': 'bookmark-os@chengmarc.com',
+    'strict_min_version': '140.0',
+    'data_collection_permissions': {'required': ['none']},
+}
+
+# Extension-only extras staged next to the site: the background sync worker
+# and the pairing (options) page. The site itself carries src/scripts/
+# extension.js, which detects the extension context at runtime.
+EXTENSION_FILES = ['background.js', 'options.html', 'options.js']
+
+# Firefox opens new windows on the homepage, not the new tab page, so
+# chrome_url_overrides alone only covers new tabs. Pointing the homepage at the
+# same page makes new windows (and the Home button) open Bookmark OS too.
+# Chrome already uses the new tab page for new windows and doesn't need this.
+FIREFOX_HOMEPAGE = {'homepage': 'index.html'}
+
+
+def stage(target: str, manifest: dict) -> Path:
+    out = BUILD / target
+    shutil.rmtree(out, ignore_errors=True)
+    out.mkdir(parents=True)
+
+    # A new tab page should read "New Tab" in the tab strip, not the
+    # website's SEO title.
+    html = (ROOT / 'index.html').read_text(encoding='utf-8-sig')
+    html = re.sub(r'<title>.*?</title>', '<title>New Tab</title>', html, count=1)
+    (out / 'index.html').write_text(html, encoding='utf-8')
+
+    shutil.copytree(ROOT / 'src', out / 'src')
+
+    for name in EXTENSION_FILES:
+        shutil.copy(PACKAGING / name, out / name)
+
+    shutil.copytree(PACKAGING / 'icons', out / 'icons')
+    (out / 'manifest.json').write_text(json.dumps(manifest, indent=2, ensure_ascii=False) + '\n', encoding='utf-8')
+    return out
+
+
+def pack(folder: Path, zip_path: Path) -> None:
+    zip_path.unlink(missing_ok=True)
+    with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as z:
+        for f in sorted(folder.rglob('*')):
+            if f.is_file():
+                z.write(f, f.relative_to(folder).as_posix())
+
+
+def main() -> None:
+    shutil.rmtree(DIST, ignore_errors=True)
+    DIST.mkdir()
+    base = json.loads((PACKAGING / 'manifest.json').read_text(encoding='utf-8'))
+    version = base['version']
+    # Firefox dialect: background scripts instead of a service worker, and
+    # host access lives in optional_permissions rather than
+    # optional_host_permissions.
+    firefox = {k: v for k, v in base.items() if k not in ('background', 'optional_host_permissions')}
+    firefox['background'] = {'scripts': ['background.js']}
+    firefox['optional_permissions'] = base.get('optional_host_permissions', [])
+    targets = {
+        'chrome':  base,
+        'firefox': {
+            **firefox,
+            'chrome_settings_overrides': FIREFOX_HOMEPAGE,
+            'browser_specific_settings': {'gecko': GECKO},
+        },
+    }
+    for target, manifest in targets.items():
+        folder = stage(target, manifest)
+        zip_path = DIST / f'bookmark-os-{target}-{version}.zip'
+        pack(folder, zip_path)
+        files = sum(1 for f in folder.rglob('*') if f.is_file())
+        print(f'{zip_path.relative_to(ROOT)}  {files} files, {zip_path.stat().st_size / 1024:.0f} KB')
+
+
+if __name__ == '__main__':
+    main()

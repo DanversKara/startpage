@@ -1,0 +1,25 @@
+[package]
+name = "startpage-server"
+version = "1.0.0"
+edition = "2021"
+
+[[bin]]
+name = "startpage-server"
+path = "src/main.rs"
+
+[dependencies]
+axum = "0.7"
+tokio = { version = "1", features = ["full"] }
+rusqlite = { version = "0.31", features = ["bundled"] }
+argon2 = "0.5"
+rand = "0.8"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-native-roots"] }
+zip = { version = "2", default-features = false, features = ["deflate"] }
+base64 = "0.23.1"
+lettre = { version = "0.11", default-features = false, features = ["smtp-transport", "builder", "tokio1", "tokio1-rustls-tls", "hostname"] }
+
+[profile.release]
+opt-level = 2

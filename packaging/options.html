@@ -1,0 +1,42 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Startpage extension — pairing</title>
+<style>
+  body { font-family: system-ui, sans-serif; background: #0b0b0f; color: #f2f2f5; margin: 0; padding: 32px 18px; }
+  .card { max-width: 520px; margin: 0 auto; background: rgba(255,255,255,.06); border: 1px solid rgba(255,255,255,.13);
+    border-radius: 16px; padding: 24px 26px; }
+  h1 { font-size: 19px; margin: 0 0 6px; }
+  p { font-size: 13.5px; color: rgba(255,255,255,.65); line-height: 1.5; }
+  label { display: block; font-size: 12px; text-transform: uppercase; letter-spacing: .08em; color: rgba(255,255,255,.55); margin: 14px 0 5px; }
+  input { width: 100%; box-sizing: border-box; padding: 9px 11px; border-radius: 9px; border: 1px solid rgba(255,255,255,.18);
+    background: rgba(255,255,255,.07); color: #fff; font-size: 14px; }
+  button { cursor: pointer; border: 0; border-radius: 9px; padding: 9px 16px; font-size: 14px; background: #2f6fed; color: #fff; margin-top: 18px; }
+  button.ghost { background: rgba(255,255,255,.12); margin-left: 8px; }
+  #status { margin-top: 14px; font-size: 13.5px; }
+  .ok { color: #7be495; } .err { color: #ff8f8f; }
+  code { background: rgba(255,255,255,.12); padding: 1px 6px; border-radius: 6px; }
+</style>
+</head>
+<body>
+<div class="card">
+  <h1>Pair this extension</h1>
+  <p>The extension caches your startpage links so new tabs work even when the server is offline.
+     Create a sync token first — in the startpage <b>admin panel → Extension sync tokens</b>, or on your
+     <b>account page</b> — then paste it here once.</p>
+  <label for="server">Server URL</label>
+  <input id="server" type="url" placeholder="https://start.dox.box" autocomplete="off">
+  <label for="token">Sync token</label>
+  <input id="token" type="password" placeholder="paste the token shown once at creation" autocomplete="off">
+  <div>
+    <button id="save" type="button">Test &amp; save</button>
+    <button id="clear" type="button" class="ghost">Clear pairing</button>
+  </div>
+  <div id="status"></div>
+  <p>The cached copy contains your real link URLs — it lives only in this browser's extension storage.
+     If this device is lost, revoke its token on the server.</p>
+</div>
+<script src="options.js"></script>
+</body>
+</html>

@@ -1,0 +1,15 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="256" height="256">
+  <!-- 3x3 grid: cell=12, gap=5, stride=17, start=9; one gradient spans all nine squares -->
+  <defs><linearGradient id="bg" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#FFFFFF"/><stop offset="1" stop-color="#ECECF1"/></linearGradient>
+  <linearGradient id="g" gradientUnits="userSpaceOnUse" x1="9" y1="9" x2="55" y2="55"><stop offset="0" stop-color="#6A5CFF"/><stop offset=".55" stop-color="#FF4FA0"/><stop offset="1" stop-color="#FF9A4D"/></linearGradient></defs>
+  <rect width="64" height="64" rx="14" fill="url(#bg)"/>
+  <rect x="9" y="9" width="12" height="12" rx="3.5" fill="url(#g)"/>
+  <rect x="26" y="9" width="12" height="12" rx="3.5" fill="url(#g)"/>
+  <rect x="43" y="9" width="12" height="12" rx="3.5" fill="url(#g)"/>
+  <rect x="9" y="26" width="12" height="12" rx="3.5" fill="url(#g)"/>
+  <rect x="26" y="26" width="12" height="12" rx="3.5" fill="url(#g)"/>
+  <rect x="43" y="26" width="12" height="12" rx="3.5" fill="url(#g)"/>
+  <rect x="9" y="43" width="12" height="12" rx="3.5" fill="url(#g)"/>
+  <rect x="26" y="43" width="12" height="12" rx="3.5" fill="url(#g)"/>
+  <rect x="43" y="43" width="12" height="12" rx="3.5" fill="url(#g)"/>
+</svg>
