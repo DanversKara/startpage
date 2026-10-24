@@ -1260,6 +1260,8 @@ body::after {
 .link-sheet[hidden] { display: none; }
 .link-sheet-card { width: min(440px, calc(100vw - 32px)); max-height: calc(100vh - 48px); overflow-y: auto; background: rgba(24,24,32,.97); border: 1px solid rgba(255,255,255,.14); border-radius: 16px; padding: 20px 22px; color: #f2f2f5; font-family: system-ui, sans-serif; box-shadow: 0 18px 50px rgba(0,0,0,.5); color-scheme: dark; }
 .link-sheet-card select option { background: #23232e; color: #f2f2f5; }
+/* Edit Desktop mode inside All Apps: tiles are editors, not links. */
+.all-apps.editing .miller-link { outline: 1px dashed rgba(255,255,255,.4); outline-offset: 2px; border-radius: 10px; }
 .ls-title { margin: 0 0 4px; font-size: 16px; }
 .ls-field { margin-top: 12px; }
 .ls-field > label { display: block; font-size: 11px; font-weight: 600; letter-spacing: .08em; text-transform: uppercase; color: rgba(255,255,255,.55); margin-bottom: 5px; }

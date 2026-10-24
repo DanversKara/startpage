@@ -392,11 +392,29 @@ let dragState = null;
 function toggleDesktopEdit(force) {
 	desktopEditing = typeof force === 'boolean' ? force : !desktopEditing;
 	$('desktop').classList.toggle('editing', desktopEditing);
+	const aa = $('allApps');
+	if (aa) aa.classList.toggle('editing', desktopEditing);
 	$('mbEdit').textContent = desktopEditing ? 'Done' : 'Edit Desktop';
 	if (!desktopEditing && dragState) endDrag(false);
 	if (!desktopEditing) closeLinkSheet();
 	renderDesktopIcons();
 }
+
+// In Edit Desktop mode, tapping a tile inside the All Apps window opens
+// the same link editor (name / icon / Place / Folder) instead of
+// following the link — that's how All Apps entries get edited and
+// moved to the desktop, a folder, or the dock.
+document.addEventListener('click', (e) => {
+	if (!desktopEditing) return;
+	const aa = $('allApps');
+	if (!aa || !aa.contains(e.target)) return;
+	const a = e.target.closest('.miller-link');
+	if (a && a.dataset.key) {
+		e.preventDefault();
+		e.stopPropagation();
+		openLinkSheet(a.dataset.key);
+	}
+}, true);
 
 function dragCellFor(left, top) {
 	return {
@@ -749,8 +767,8 @@ function ensureLinkSheet() {
 	const groupList = el('datalist', { id: 'lsGroupList' });
 	const groupRow = field('Group', groupIn);
 	groupRow.appendChild(groupList);
-	const unfolderBtn = el('button', { class: 'report-btn', type: 'button', text: 'Remove from folder', hidden: true });
-	const unfolderRow = el('div', { class: 'ls-field' }, unfolderBtn);
+	const folderSel = el('select', { class: 'ls-input' });
+	const folderRow = field('Folder', folderSel);
 	const iconPrev = el('img', { class: 'ls-icon-prev', alt: '' });
 	const iconIn = el('input', { class: 'ls-input', placeholder: 'Auto (the site’s own icon)' });
 	const fileIn = el('input', { type: 'file', accept: 'image/*', hidden: true });
@@ -774,16 +792,15 @@ function ensureLinkSheet() {
 	const cancelBtn = el('button', { class: 'report-btn', type: 'button', text: 'Cancel' });
 	const saveBtn = el('button', { class: 'report-btn primary', type: 'button', text: 'Save' });
 	const card = el('div', { class: 'link-sheet-card' },
-		title, field('Name', labelIn), urlRow, sectionRow, groupRow, unfolderRow, iconRow, bgRow, msg,
+		title, field('Name', labelIn), urlRow, sectionRow, folderRow, groupRow, iconRow, bgRow, msg,
 		el('div', { class: 'report-actions ls-actions' }, delBtn, el('span', { class: 'ls-spacer' }), cancelBtn, saveBtn),
 	);
 	const pop = el('div', { class: 'link-sheet', hidden: true }, card);
 	pop.addEventListener('pointerdown', e => { if (e.target === pop) closeLinkSheet(); });
 	document.body.appendChild(pop);
 	linkSheetEl = pop;
-	pop._f = { title, labelIn, urlIn, urlRow, sectionSel, sectionRow, groupIn, groupRow, groupList, unfolderBtn, unfolderRow, iconPrev, iconIn, fileIn, picker: iconRow.querySelector('.ls-picker'), bgColor, bgIn, msg, delBtn, saveBtn };
-	unfolderBtn.addEventListener('click', () => saveLinkSheet(true));
-	sectionSel.addEventListener('change', () => syncLsGroupRow());
+	pop._f = { title, labelIn, urlIn, urlRow, sectionSel, sectionRow, folderSel, folderRow, groupIn, groupRow, groupList, iconPrev, iconIn, fileIn, picker: iconRow.querySelector('.ls-picker'), bgColor, bgIn, msg, delBtn, saveBtn };
+	sectionSel.addEventListener('change', () => { syncLsGroupRow(); syncLsFolderRow(); });
 	const syncPrev = () => {
 		const v = iconIn.value.trim();
 		iconPrev.src = v || (lsRow ? '/icon/' + lsRow.id : 'src/icons/globe.svg');
@@ -839,6 +856,19 @@ async function buildLsPicker() {
 
 let lsAllLinks = [];
 
+function syncLsFolderRow() {
+	const F = linkSheetEl._f;
+	const isFolderKind = !!(lsRow && lsRow.kind === 'folder');
+	const show = F.sectionSel.value === 'desktop' && !isFolderKind;
+	F.folderRow.style.display = show ? '' : 'none';
+	if (!show) return;
+	F.folderSel.innerHTML = '';
+	F.folderSel.appendChild(el('option', { value: '', text: 'No folder' }));
+	lsAllLinks.filter(l => l.kind === 'folder' && (!lsRow || l.id !== lsRow.id))
+		.forEach(f => F.folderSel.appendChild(el('option', { value: f.id, text: f.label })));
+	F.folderSel.value = lsRow && lsRow.folder_id ? lsRow.folder_id : '';
+}
+
 function syncLsGroupRow() {
 	const F = linkSheetEl._f;
 	const sec = F.sectionSel.value;
@@ -876,9 +906,7 @@ async function openLinkSheet(id, presetSection) {
 	F.sectionRow.style.display = isFolder ? 'none' : '';
 	F.groupIn.value = row && row.group_title ? row.group_title : '';
 	syncLsGroupRow();
-	const inFolder = !!(row && row.folder_id);
-	F.unfolderRow.style.display = inFolder ? '' : 'none';
-	F.unfolderBtn.hidden = !inFolder;
+	syncLsFolderRow();
 	F.iconIn.value = row && row.icon_mode !== 'auto' && !String(row.icon || '').startsWith('/icon/') ? row.icon : '';
 	F.bgIn.value = row && row.icon_bg ? row.icon_bg : '';
 	if (F.bgIn.value) F.bgColor.value = F.bgIn.value;
@@ -905,7 +933,7 @@ async function refreshAfterLinkChange() {
 	}
 }
 
-async function saveLinkSheet(removeFromFolder) {
+async function saveLinkSheet() {
 	const F = linkSheetEl._f;
 	const iconVal = F.iconIn.value.trim();
 	const isFolder = !!(lsRow && lsRow.kind === 'folder');
@@ -918,7 +946,9 @@ async function saveLinkSheet(removeFromFolder) {
 		icon: iconVal || null,
 		icon_bg: F.bgIn.value.trim() || null,
 	};
-	if (removeFromFolder) { body.folder_id = ''; body.section = 'desktop'; }
+	// Folder membership rides along whenever the link lands on the
+	// desktop: the select's value is a folder id, or '' for no folder.
+	if (body.section === 'desktop' && !isFolder) body.folder_id = F.folderSel.value;
 	if (body.section === 'apps' || body.section === 'about') body.group_title = F.groupIn.value;
 	if (!body.label) { F.msg.textContent = 'Give it a name first.'; return; }
 	if (!isFolder && !body.url) { F.msg.textContent = 'Add the address (https://…).'; return; }

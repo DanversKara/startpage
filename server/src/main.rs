@@ -526,19 +526,25 @@ async fn api_state(State(st): State<Shared>, headers: HeaderMap) -> Response {
                     }
                 }
                 "dock" => dock.push(entry),
-                "about" => {
-                    let title = l.group.clone().unwrap_or_else(|| "Links".to_string());
-                    match about.iter_mut().find(|(t, _)| *t == title) {
-                        Some((_, links)) => links.push(entry),
-                        None => about.push((title, vec![entry])),
-                    }
-                }
+                // The About card is site-wide branding: it is filled from
+                // the ADMIN's rows below, never the viewer's own.
+                "about" => {}
                 _ => {
                     let title = l.group.clone().unwrap_or_else(|| "Apps".to_string());
                     match apps.iter_mut().find(|(t, _)| *t == title) {
                         Some((_, links)) => links.push(entry),
                         None => apps.push((title, vec![entry])),
                     }
+                }
+            }
+        }
+        if let Some(admin) = admin_user(&db) {
+            for l in links_of(&db, &admin.id).iter().filter(|l| l.section == "about") {
+                let entry = serde_json::json!({ "id": l.id, "label": l.label, "icon": l.icon, "icon_bg": l.icon_bg });
+                let title = l.group.clone().unwrap_or_else(|| "Links".to_string());
+                match about.iter_mut().find(|(t, _)| *t == title) {
+                    Some((_, links)) => links.push(entry),
+                    None => about.push((title, vec![entry])),
                 }
             }
         }
@@ -1080,19 +1086,30 @@ fn sync_payload(db: &Connection, owner: &str) -> serde_json::Value {
                 desktop.push(entry);
             }
             "dock" => dock.push(entry),
-            "about" => {
-                let title = l.group.clone().unwrap_or_else(|| "Links".to_string());
-                match about.iter_mut().find(|(t, _)| *t == title) {
-                    Some((_, links)) => links.push(entry),
-                    None => about.push((title, vec![entry])),
-                }
-            }
+            // About = the ADMIN's branding rows (filled below), not the owner's.
+            "about" => {}
             _ => {
                 let title = l.group.clone().unwrap_or_else(|| "Apps".to_string());
                 match apps.iter_mut().find(|(t, _)| *t == title) {
                     Some((_, links)) => links.push(entry),
                     None => apps.push((title, vec![entry])),
                 }
+            }
+        }
+    }
+    if let Some(admin) = admin_user(db) {
+        for l in links_of(db, &admin.id).iter().filter(|l| l.section == "about") {
+            let (url, is_admin) = if l.kind == "admin" {
+                (format!("/{}", apath), true)
+            } else {
+                (l.url.clone().unwrap_or_default(), false)
+            };
+            let mut entry = serde_json::json!({ "label": l.label, "url": url, "icon": l.icon, "icon_bg": l.icon_bg });
+            if is_admin { entry["admin"] = serde_json::json!(true); }
+            let title = l.group.clone().unwrap_or_else(|| "Links".to_string());
+            match about.iter_mut().find(|(t, _)| *t == title) {
+                Some((_, links)) => links.push(entry),
+                None => about.push((title, vec![entry])),
             }
         }
     }
@@ -2206,10 +2223,16 @@ async fn me_links_update(State(st): State<Shared>, headers: HeaderMap, Path(id):
         if input.folder_id.is_none() && !clear_folder { input.folder_id = existing.folder_id.clone(); }
         if input.group_title.is_none() { input.group_title = existing.group_title.clone(); }
         if input.section != existing.section && input.section == "desktop" && existing.section != "desktop" {
-            let (c, r) = next_free_cell(&db, &sess.user.id);
-            input.col = Some(c);
-            input.row = Some(r);
-            input.folder_id = None;
+            if input.folder_id.is_some() {
+                // The editor named a folder to land in — no grid cell.
+                input.col = None;
+                input.row = None;
+            } else {
+                let (c, r) = next_free_cell(&db, &sess.user.id);
+                input.col = Some(c);
+                input.row = Some(r);
+                input.folder_id = None;
+            }
         }
         if input.section != existing.section && input.section != "desktop" {
             // Leaving the desktop (to dock / All Apps / About) leaves any folder.
