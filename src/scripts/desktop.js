@@ -750,6 +750,11 @@ function ensureLinkSheet() {
 	if (linkSheetEl) return linkSheetEl;
 	const field = (labelText, node) => el('div', { class: 'ls-field' }, el('label', { text: labelText }), node);
 	const title = el('h3', { class: 'ls-title', text: 'Edit link' });
+	const kindSel = el('select', { class: 'ls-input' },
+		el('option', { value: 'url', text: 'Link' }),
+		el('option', { value: 'folder', text: 'Folder' }),
+	);
+	const kindRow = field('Type', kindSel);
 	const labelIn = el('input', { class: 'ls-input', maxlength: 120, placeholder: 'Name' });
 	const urlIn = el('input', { class: 'ls-input', placeholder: 'https://example.com' });
 	const urlRow = field('Address', urlIn);
@@ -792,15 +797,16 @@ function ensureLinkSheet() {
 	const cancelBtn = el('button', { class: 'report-btn', type: 'button', text: 'Cancel' });
 	const saveBtn = el('button', { class: 'report-btn primary', type: 'button', text: 'Save' });
 	const card = el('div', { class: 'link-sheet-card' },
-		title, field('Name', labelIn), urlRow, sectionRow, folderRow, groupRow, iconRow, bgRow, msg,
+		title, kindRow, field('Name', labelIn), urlRow, sectionRow, folderRow, groupRow, iconRow, bgRow, msg,
 		el('div', { class: 'report-actions ls-actions' }, delBtn, el('span', { class: 'ls-spacer' }), cancelBtn, saveBtn),
 	);
 	const pop = el('div', { class: 'link-sheet', hidden: true }, card);
 	pop.addEventListener('pointerdown', e => { if (e.target === pop) closeLinkSheet(); });
 	document.body.appendChild(pop);
 	linkSheetEl = pop;
-	pop._f = { title, labelIn, urlIn, urlRow, sectionSel, sectionRow, folderSel, folderRow, groupIn, groupRow, groupList, iconPrev, iconIn, fileIn, picker: iconRow.querySelector('.ls-picker'), bgColor, bgIn, msg, delBtn, saveBtn };
+	pop._f = { title, kindSel, kindRow, labelIn, urlIn, urlRow, sectionSel, sectionRow, folderSel, folderRow, groupIn, groupRow, groupList, iconPrev, iconIn, fileIn, iconRow, bgRow, picker: iconRow.querySelector('.ls-picker'), bgColor, bgIn, msg, delBtn, saveBtn };
 	sectionSel.addEventListener('change', () => { syncLsGroupRow(); syncLsFolderRow(); });
+	kindSel.addEventListener('change', () => syncLsKindRows());
 	const syncPrev = () => {
 		const v = iconIn.value.trim();
 		iconPrev.src = v || (lsRow ? '/icon/' + lsRow.id : 'src/icons/globe.svg');
@@ -856,6 +862,26 @@ async function buildLsPicker() {
 
 let lsAllLinks = [];
 
+// Create-mode Type picker: a Folder needs only a name — the address,
+// place, folder, group and icon rows all hide.
+function syncLsKindRows() {
+	const F = linkSheetEl._f;
+	const isFolder = !lsRow && F.kindSel.value === 'folder';
+	F.urlRow.style.display = isFolder ? 'none' : '';
+	F.sectionRow.style.display = isFolder ? 'none' : '';
+	F.iconRow.style.display = isFolder ? 'none' : '';
+	F.bgRow.style.display = isFolder ? 'none' : '';
+	if (isFolder) {
+		F.folderRow.style.display = 'none';
+		F.groupRow.style.display = 'none';
+		F.title.textContent = 'New folder';
+	} else {
+		if (!lsRow) F.title.textContent = 'Add link';
+		syncLsGroupRow();
+		syncLsFolderRow();
+	}
+}
+
 function syncLsFolderRow() {
 	const F = linkSheetEl._f;
 	const isFolderKind = !!(lsRow && lsRow.kind === 'folder');
@@ -899,6 +925,9 @@ async function openLinkSheet(id, presetSection) {
 	lsRow = row;
 	const isFolder = !!(row && row.kind === 'folder');
 	F.title.textContent = row ? (isFolder ? 'Edit folder' : 'Edit link') : 'Add link';
+	F.kindRow.style.display = row ? 'none' : '';
+	F.kindSel.value = 'url';
+	syncLsKindRows();
 	F.labelIn.value = row ? row.label : '';
 	F.urlIn.value = row && row.url ? row.url : '';
 	F.urlRow.style.display = isFolder ? 'none' : '';
@@ -936,10 +965,10 @@ async function refreshAfterLinkChange() {
 async function saveLinkSheet() {
 	const F = linkSheetEl._f;
 	const iconVal = F.iconIn.value.trim();
-	const isFolder = !!(lsRow && lsRow.kind === 'folder');
+	const isFolder = lsRow ? lsRow.kind === 'folder' : F.kindSel.value === 'folder';
 	const body = {
 		label: F.labelIn.value.trim(),
-		kind: lsRow ? lsRow.kind : 'url',
+		kind: isFolder ? 'folder' : (lsRow ? lsRow.kind : 'url'),
 		section: isFolder ? 'desktop' : F.sectionSel.value,
 		url: isFolder ? null : F.urlIn.value.trim(),
 		icon_mode: iconVal ? 'bundled' : 'auto',
