@@ -2136,6 +2136,9 @@ async fn me_links_create(State(st): State<Shared>, headers: HeaderMap, Json(mut 
         return r;
     }
     input.owner = Some(sess.user.id.clone());
+    // The editor's Folder picker sends "" for "No folder" — that means
+    // no folder at all on create (on update it means "remove").
+    if input.folder_id.as_deref() == Some("") { input.folder_id = None; }
     let (id, url_for_icon) = {
         let db = st.db.lock().unwrap();
         let admin_id = admin_user(&db).map(|u| u.id).unwrap_or_default();
