@@ -194,6 +194,192 @@ fn admin_path(db: &Connection) -> String {
     get_setting(db, "admin_path").unwrap_or_default()
 }
 
+// ─────────────────────────────────────────────────────────────────────
+// Locked folders & All Apps groups (v1.18.0) — a lock lives in the
+// `locks` table keyed by (owner, target): "folder:<link id>" or
+// "group:<owner id>:apps:<group title>". Unlocking mints a grant
+// token = sha256(secret | target | pass_hash) carried in the
+// sp_unlock cookie; changing or removing the password rotates the
+// hash and kills every outstanding grant.
+// ─────────────────────────────────────────────────────────────────────
+const UNLOCK_COOKIE: &str = "sp_unlock";
+
+fn cookie_get(headers: &HeaderMap, name: &str) -> Option<String> {
+    let cookie = headers.get(header::COOKIE)?.to_str().ok()?;
+    for part in cookie.split(';') {
+        let part = part.trim();
+        if let Some(v) = part.strip_prefix(&format!("{name}=")) {
+            return Some(v.to_string());
+        }
+    }
+    None
+}
+
+fn lock_hash_of(db: &Connection, owner: &str, target: &str) -> Option<String> {
+    db.query_row("SELECT pass_hash FROM locks WHERE owner_id = ?1 AND target = ?2", params![owner, target], |r| r.get(0)).ok()
+}
+
+fn grant_token(db: &Connection, target: &str, pass_hash: &str) -> String {
+    let secret = get_setting(db, "unlock_secret").unwrap_or_default();
+    sha256_hex(&format!("{secret}|{target}|{pass_hash}"))
+}
+
+/// The set of lock targets this request has a valid grant for.
+fn unlocked_targets(db: &Connection, headers: &HeaderMap) -> std::collections::HashSet<String> {
+    let mut out = std::collections::HashSet::new();
+    let raw = match cookie_get(headers, UNLOCK_COOKIE) {
+        Some(v) => v,
+        None => return out,
+    };
+    use base64::Engine;
+    for pair in raw.split(',') {
+        let (b64, token) = match pair.split_once('=') {
+            Some(p) => p,
+            None => continue,
+        };
+        let target = match base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(b64) {
+            Ok(b) => String::from_utf8(b).unwrap_or_default(),
+            Err(_) => continue,
+        };
+        if target.is_empty() { continue; }
+        let row: Option<(String, String)> = db
+            .query_row("SELECT owner_id, pass_hash FROM locks WHERE target = ?1", params![target], |r| Ok((r.get(0)?, r.get(1)?)))
+            .ok();
+        if let Some((_owner, hash)) = row {
+            if grant_token(db, &target, &hash) == token {
+                out.insert(target);
+            }
+        }
+    }
+    out
+}
+
+fn unlock_cookie_value(db: &Connection, headers: &HeaderMap, target: &str, pass_hash: &str) -> String {
+    use base64::Engine;
+    let mut pairs: Vec<String> = Vec::new();
+    if let Some(raw) = cookie_get(headers, UNLOCK_COOKIE) {
+        for pair in raw.split(',') {
+            let (b64, _) = match pair.split_once('=') {
+                Some(p) => p,
+                None => continue,
+            };
+            let t = base64::engine::general_purpose::URL_SAFE_NO_PAD
+                .decode(b64)
+                .map(|b| String::from_utf8(b).unwrap_or_default())
+                .unwrap_or_default();
+            if t != target && !t.is_empty() {
+                pairs.push(pair.to_string());
+            }
+        }
+    }
+    let b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(target.as_bytes());
+    pairs.push(format!("{b64}={}", grant_token(db, target, pass_hash)));
+    pairs.join(",")
+}
+
+/// If this link sits inside a locked folder or a locked All Apps
+/// group, return the lock target (unless the request already holds a
+/// grant, in which case None — access proceeds).
+fn link_lock_target(db: &Connection, headers: &HeaderMap, owner: &str, section: &str, group_title: &Option<String>, folder_id: &Option<String>) -> Option<String> {
+    let target = if let Some(fid) = folder_id {
+        let t = format!("folder:{fid}");
+        if lock_hash_of(db, owner, &t).is_some() { Some(t) } else { None }
+    } else if section == "apps" {
+        let title = group_title.clone().unwrap_or_else(|| "Apps".to_string());
+        let t = format!("group:{owner}:apps:{title}");
+        if lock_hash_of(db, owner, &t).is_some() { Some(t) } else { None }
+    } else {
+        None
+    };
+    match target {
+        Some(t) if !unlocked_targets(db, headers).contains(&t) => Some(t),
+        _ => None,
+    }
+}
+
+#[derive(Deserialize)]
+struct UnlockReq {
+    target: String,
+    password: String,
+}
+
+async fn api_unlock(State(st): State<Shared>, headers: HeaderMap, Json(body): Json<UnlockReq>) -> Response {
+    let (found, resp) = {
+        let db = st.db.lock().unwrap();
+        let row: Option<(String, String)> = db
+            .query_row("SELECT owner_id, pass_hash FROM locks WHERE target = ?1", params![body.target], |r| Ok((r.get(0)?, r.get(1)?)))
+            .ok();
+        match row {
+            None => (false, None),
+            Some((_owner, hash)) => {
+                if verify_password(&body.password, &hash) {
+                    let value = unlock_cookie_value(&db, &headers, &body.target, &hash);
+                    (true, Some(value))
+                } else {
+                    (false, None)
+                }
+            }
+        }
+    };
+    match resp {
+        Some(value) => {
+            let mut r = json_response(StatusCode::OK, serde_json::json!({ "ok": true }));
+            r.headers_mut().insert(
+                header::SET_COOKIE,
+                header::HeaderValue::from_str(&format!("{UNLOCK_COOKIE}={value}; Path=/; HttpOnly; SameSite=Lax; Max-Age=43200"))
+                    .unwrap_or_else(|_| header::HeaderValue::from_static("")),
+            );
+            r
+        }
+        None => {
+            // Slow wrong answers down a little (argon2 already costs).
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            let _ = found;
+            err_json(StatusCode::FORBIDDEN, "wrong password")
+        }
+    }
+}
+
+/// The page /go (and its cousins) show instead of the destination
+/// when the item sits behind a lock the visitor hasn't opened.
+fn locked_page(target: &str, back: &str) -> Response {
+    let target_js = serde_json::to_string(target).unwrap_or_else(|_| "\"\"".to_string());
+    let back_js = serde_json::to_string(back).unwrap_or_else(|_| "\"/\"".to_string());
+    let html = r##"<!doctype html><html><head><meta charset="utf-8"><title>Locked</title>
+<meta name="referrer" content="no-referrer"><meta name="viewport" content="width=device-width, initial-scale=1"></head>
+<body style="font-family:system-ui,sans-serif;background:#10121a;color:#e8eaf2;display:flex;align-items:center;justify-content:center;min-height:100vh;margin:0">
+<div style="text-align:center;max-width:22em;padding:2em">
+<p style="font-size:2.2em;margin:0">🔒</p>
+<p style="font-size:1.05em">This item is in a password-protected folder or group.</p>
+<p><input id="pw" type="password" placeholder="Password" autocomplete="current-password"
+ style="width:100%;box-sizing:border-box;padding:.7em;border-radius:10px;border:1px solid #3a3f55;background:#171a26;color:#fff;font-size:1em"></p>
+<p id="err" style="color:#ff9d9d;min-height:1.2em"></p>
+<p><button id="go" style="background:#2f6bff;color:#fff;padding:.7em 1.4em;border:0;border-radius:12px;font-weight:600;font-size:1em;cursor:pointer">Unlock</button></p>
+<p><a href="/" style="color:#9db9ff">Return to the start page</a></p>
+</div>
+<script>
+var TARGET = __TARGET__, BACK = __BACK__;
+async function unlock() {
+  var r = await fetch('/api/unlock', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ target: TARGET, password: document.getElementById('pw').value }) });
+  if (r.ok) { location.replace(BACK); }
+  else { document.getElementById('err').textContent = 'Wrong password.'; }
+}
+document.getElementById('go').addEventListener('click', unlock);
+document.getElementById('pw').addEventListener('keydown', function (e) { if (e.key === 'Enter') unlock(); });
+document.getElementById('pw').focus();
+</script></body></html>"##
+        .replace("__TARGET__", &target_js)
+        .replace("__BACK__", &back_js);
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "text/html; charset=utf-8")
+        .header(header::REFERRER_POLICY, "no-referrer")
+        .header(header::CACHE_CONTROL, "no-store")
+        .body(Body::from(html))
+        .unwrap()
+}
+
 fn valid_username(s: &str) -> bool {
     !s.is_empty() && s.len() <= 32 && s.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-'))
 }
@@ -490,12 +676,13 @@ async fn api_state(State(st): State<Shared>, headers: HeaderMap) -> Response {
     let owner = viewer_owner(&st, &headers);
     let mut desktop = Vec::new();
     let mut dock = Vec::new();
-    let mut apps: Vec<(String, Vec<serde_json::Value>)> = Vec::new();
+    let mut apps: Vec<(String, Vec<serde_json::Value>, Option<(bool, String)>)> = Vec::new();
     let mut about: Vec<(String, Vec<serde_json::Value>)> = Vec::new();
     let mut branding = default_branding();
     if let Some(owner) = owner {
         let db = st.db.lock().unwrap();
         branding = get_branding(&db);
+        let grants = unlocked_targets(&db, &headers);
         let rows = links_of(&db, &owner);
         // Folder members ride inside their folder's entry, not the top level.
         let mut members: std::collections::HashMap<String, Vec<serde_json::Value>> = std::collections::HashMap::new();
@@ -514,10 +701,24 @@ async fn api_state(State(st): State<Shared>, headers: HeaderMap) -> Response {
                 "desktop" => {
                     if l.folder_id.is_some() { continue; }
                     if l.kind == "folder" {
+                        // Locked folder: members shrink to icon-only
+                        // placeholders (the tile mosaic, blurred) until
+                        // a grant cookie says the visitor unlocked it.
+                        let f_target = format!("folder:{}", l.id);
+                        let f_locked = lock_hash_of(&db, &owner, &f_target).is_some();
+                        let f_unlocked = f_locked && grants.contains(&f_target);
+                        let mem = members.get(&l.id).cloned().unwrap_or_default();
+                        let mem = if f_locked && !f_unlocked {
+                            mem.iter()
+                                .map(|m| serde_json::json!({ "icon": m["icon"], "icon_bg": m["icon_bg"] }))
+                                .collect::<Vec<_>>()
+                        } else {
+                            mem
+                        };
                         desktop.push(serde_json::json!({
                             "id": l.id, "label": l.label, "icon": l.icon, "icon_bg": l.icon_bg, "col": l.col, "row": l.row,
-                            "folder": true,
-                            "members": members.get(&l.id).cloned().unwrap_or_default()
+                            "folder": true, "locked": f_locked, "unlocked": f_unlocked,
+                            "members": mem
                         }));
                     } else {
                         desktop.push(serde_json::json!({
@@ -530,10 +731,21 @@ async fn api_state(State(st): State<Shared>, headers: HeaderMap) -> Response {
                 // the ADMIN's rows below, never the viewer's own.
                 "about" => {}
                 _ => {
+                    // All Apps group: a locked group sends icon-only
+                    // placeholders (no id, no label) until unlocked.
                     let title = l.group.clone().unwrap_or_else(|| "Apps".to_string());
-                    match apps.iter_mut().find(|(t, _)| *t == title) {
-                        Some((_, links)) => links.push(entry),
-                        None => apps.push((title, vec![entry])),
+                    let g_target = format!("group:{owner}:apps:{title}");
+                    let g_locked = lock_hash_of(&db, &owner, &g_target).is_some();
+                    let g_unlocked = g_locked && grants.contains(&g_target);
+                    let shown = if g_locked && !g_unlocked {
+                        serde_json::json!({ "id": "", "label": "", "icon": l.icon, "icon_bg": l.icon_bg, "locked": true, "lock_target": g_target })
+                    } else {
+                        entry
+                    };
+                    let lk = if g_locked { Some((g_unlocked, g_target)) } else { None };
+                    match apps.iter_mut().find(|(t, _, _)| *t == title) {
+                        Some((_, links, _)) => links.push(shown),
+                        None => apps.push((title, vec![shown], lk)),
                     }
                 }
             }
@@ -552,8 +764,20 @@ async fn api_state(State(st): State<Shared>, headers: HeaderMap) -> Response {
     let group = |v: Vec<(String, Vec<serde_json::Value>)>| -> Vec<serde_json::Value> {
         v.into_iter().map(|(title, links)| serde_json::json!({ "title": title, "links": links })).collect()
     };
+    let apps_json: Vec<serde_json::Value> = apps
+        .into_iter()
+        .map(|(title, links, lk)| {
+            let mut o = serde_json::json!({ "title": title, "links": links });
+            if let Some((unlocked, target)) = lk {
+                o["locked"] = serde_json::json!(true);
+                o["unlocked"] = serde_json::json!(unlocked);
+                o["lock_target"] = serde_json::json!(target);
+            }
+            o
+        })
+        .collect();
     json_response(StatusCode::OK, serde_json::json!({
-        "desktop": desktop, "dock": dock, "apps": group(apps), "about": group(about), "branding": branding
+        "desktop": desktop, "dock": dock, "apps": apps_json, "about": group(about), "branding": branding
     }))
 }
 
@@ -825,29 +1049,34 @@ location.replace(__TARGET_JS__);
 async fn go(State(st): State<Shared>, headers: HeaderMap, Path(id): Path<String>) -> Response {
     // Resolve the session BEFORE taking the db lock (session lookup locks too).
     let session_uid = session_from_headers(&st, &headers).map(|s| s.user.id);
-    let (target, label) = {
+    let (target, label, early) = {
         let db = st.db.lock().unwrap();
-        let row: Option<(String, String, Option<String>, String)> = db
-            .query_row("SELECT owner_id, kind, url, label FROM links WHERE id = ?1", params![id], |r| {
-                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+        let row: Option<(String, String, Option<String>, String, String, Option<String>, Option<String>)> = db
+            .query_row("SELECT owner_id, kind, url, label, section, group_title, folder_id FROM links WHERE id = ?1", params![id], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?))
             })
             .ok();
         let admin_id = admin_user(&db).map(|u| u.id);
         let public_id = default_owner(&db);
         match row {
-            Some((owner, kind, url, label)) => {
+            Some((owner, kind, url, label, section, group, folder_id)) => {
                 let allowed = Some(&owner) == public_id.as_ref() || Some(&owner) == session_uid.as_ref();
                 if !allowed {
-                    (None, String::new())
+                    (None, String::new(), None)
+                } else if let Some(lt) = link_lock_target(&db, &headers, &owner, &section, &group, &folder_id) {
+                    (None, String::new(), Some(locked_page(&lt, &format!("/go/{id}"))))
                 } else if kind == "admin" {
-                    (Some(format!("/{}", admin_path(&db))), label)
+                    (Some(format!("/{}", admin_path(&db))), label, None)
                 } else {
-                    (url, label)
+                    (url, label, None)
                 }
             }
-            None => (None, String::new()),
+            None => (None, String::new(), None),
         }
     };
+    if let Some(r) = early {
+        return r;
+    }
     match target {
         // Container links can't be a plain redirect — a cross-scheme 302
         // is unreliable. Land on a tiny page that hands the URL to the
@@ -1081,7 +1310,14 @@ fn sync_payload(db: &Connection, owner: &str) -> serde_json::Value {
                 entry["row"] = serde_json::json!(l.row);
                 if l.kind == "folder" {
                     entry["folder"] = serde_json::json!(true);
-                    entry["members"] = serde_json::json!(members.get(&l.id).cloned().unwrap_or_default());
+                    // The extension cache never carries locked members.
+                    let f_target = format!("folder:{}", l.id);
+                    if lock_hash_of(db, owner, &f_target).is_some() {
+                        entry["locked"] = serde_json::json!(true);
+                        entry["members"] = serde_json::json!(Vec::<serde_json::Value>::new());
+                    } else {
+                        entry["members"] = serde_json::json!(members.get(&l.id).cloned().unwrap_or_default());
+                    }
                 }
                 desktop.push(entry);
             }
@@ -1089,7 +1325,15 @@ fn sync_payload(db: &Connection, owner: &str) -> serde_json::Value {
             // About = the ADMIN's branding rows (filled below), not the owner's.
             "about" => {}
             _ => {
+                // Locked All Apps groups sync as an empty, flagged group.
                 let title = l.group.clone().unwrap_or_else(|| "Apps".to_string());
+                let g_target = format!("group:{owner}:apps:{title}");
+                if lock_hash_of(db, owner, &g_target).is_some() {
+                    if !apps.iter().any(|(t, _)| *t == title) {
+                        apps.push((title, Vec::new()));
+                    }
+                    continue;
+                }
                 match apps.iter_mut().find(|(t, _)| *t == title) {
                     Some((_, links)) => links.push(entry),
                     None => apps.push((title, vec![entry])),
@@ -1910,7 +2154,7 @@ fn share_icon_src(icon: &str, id: &str) -> String {
     }
 }
 
-async fn share_landing(State(st): State<Shared>, Path(token): Path<String>) -> Response {
+async fn share_landing(State(st): State<Shared>, headers: HeaderMap, Path(token): Path<String>) -> Response {
     let db = st.db.lock().unwrap();
     let product = product_name(&db);
     let gone = |db: &Connection| {
@@ -1926,8 +2170,14 @@ async fn share_landing(State(st): State<Shared>, Path(token): Path<String>) -> R
     };
     let _ = db.execute("UPDATE shares SET views = views + 1 WHERE id = ?1", params![sid]);
     let owner_name = user_by_id(&db, &item.owner_id).map(|u| u.username).unwrap_or_default();
+    // A locked folder shares as a locked page: no member tiles until
+    // the visitor unlocks it (the unlock form posts the folder target).
+    let folder_target = format!("folder:{}", item.id);
+    let folder_locked = item.kind == "folder"
+        && lock_hash_of(&db, &item.owner_id, &folder_target).is_some()
+        && !unlocked_targets(&db, &headers).contains(&folder_target);
     let mut tiles: Vec<(String, String, String, Option<String>)> = Vec::new();
-    if item.kind == "folder" {
+    if item.kind == "folder" && !folder_locked {
         if let Ok(mut stmt) = db.prepare(
             "SELECT id, label, icon, icon_bg FROM links WHERE folder_id = ?1 AND kind != 'admin' ORDER BY sort, label",
         ) {
@@ -1945,31 +2195,34 @@ async fn share_landing(State(st): State<Shared>, Path(token): Path<String>) -> R
     }
     html_page(
         StatusCode::OK,
-        admin_page::share_page(&product, &item.id, &item.label, item.kind == "folder", &owner_name, &token, &tiles),
+        admin_page::share_page(&product, &item.id, &item.label, item.kind == "folder", &owner_name, &token, &tiles, folder_locked),
         true,
     )
 }
 
-async fn share_open(State(st): State<Shared>, Path((token, link_id)): Path<(String, String)>) -> Response {
+async fn share_open(State(st): State<Shared>, headers: HeaderMap, Path((token, link_id)): Path<(String, String)>) -> Response {
     let db = st.db.lock().unwrap();
     let shared_link = match share_by_token(&db, &token) {
         Some(s) if share_live(s.2) => s.1,
         _ => return err_json(StatusCode::NOT_FOUND, "share not found"),
     };
-    let row: Option<(String, Option<String>, Option<String>, String)> = db
+    let row: Option<(String, String, Option<String>, Option<String>, String, String, Option<String>)> = db
         .query_row(
-            "SELECT kind, url, folder_id, label FROM links WHERE id = ?1",
+            "SELECT owner_id, kind, url, folder_id, label, section, group_title FROM links WHERE id = ?1",
             params![link_id],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?)),
         )
         .ok();
-    let (kind, url, folder_id, label) = match row {
+    let (owner, kind, url, folder_id, label, section, group) = match row {
         Some(v) => v,
         None => return err_json(StatusCode::NOT_FOUND, "link not found"),
     };
     let authorized = link_id == shared_link || folder_id.as_deref() == Some(shared_link.as_str());
     if kind == "admin" || !authorized {
         return err_json(StatusCode::NOT_FOUND, "link not found");
+    }
+    if let Some(lt) = link_lock_target(&db, &headers, &owner, &section, &group, &folder_id) {
+        return locked_page(&lt, &format!("/s/{token}/go/{link_id}"));
     }
     match url {
         Some(t) if is_container_url(&t) => container_handoff_response(&label, &t),
@@ -2174,6 +2427,10 @@ async fn me_links_create(State(st): State<Shared>, headers: HeaderMap, Json(mut 
         if let Some(bg) = sanitize_icon_bg(&input.icon_bg) {
             let _ = db.execute("UPDATE links SET icon_bg = ?1 WHERE id = ?2", params![bg, id]);
         }
+        if let Err(msg) = apply_lock_pass(&db, &owner, &kind, &section, &group, &id, &input.lock_pass) {
+            let _ = db.execute("DELETE FROM links WHERE id = ?1", params![id]);
+            return admin_json(StatusCode::BAD_REQUEST, serde_json::json!({ "error": msg }));
+        }
         let fetch = if icon_mode == "auto" && kind == "url" { url.clone() } else { None };
         (id, fetch)
     };
@@ -2259,6 +2516,9 @@ async fn me_links_update(State(st): State<Shared>, headers: HeaderMap, Path(id):
             params![kind, label, url, icon_stored, section, col, row, sort, group, fid, sanitize_icon_bg(&input.icon_bg), id],
         );
         let _ = db.execute("DELETE FROM favicons WHERE link_id = ?1", params![id]);
+        if let Err(msg) = apply_lock_pass(&db, &sess.user.id, &kind, &section, &group, &id, &input.lock_pass) {
+            return admin_json(StatusCode::BAD_REQUEST, serde_json::json!({ "error": msg }));
+        }
         if icon_mode == "auto" && kind == "url" { url } else { None }
     };
     if let Some(u) = fetch {
@@ -2688,6 +2948,11 @@ async fn profile_landing(State(st): State<Shared>, Path(username): Path<String>)
                 .collect();
             for (i, (_, _, tiles)) in folders.iter_mut().enumerate() {
                 if let Some(fid) = folder_ids.get(i) {
+                    // Locked folders keep their members off the public
+                    // profile entirely (empty folders don't render).
+                    if lock_hash_of(&db, &u.id, &format!("folder:{fid}")).is_some() {
+                        continue;
+                    }
                     if let Some(m) = members.remove(fid) {
                         *tiles = m;
                     }
@@ -2714,6 +2979,7 @@ async fn profile_landing(State(st): State<Shared>, Path(username): Path<String>)
 
 async fn profile_open(
     State(st): State<Shared>,
+    headers: HeaderMap,
     Path((username, link_id)): Path<(String, String)>,
 ) -> Response {
     let db = st.db.lock().unwrap();
@@ -2721,19 +2987,22 @@ async fn profile_open(
         Some(v) => v,
         None => return err_json(StatusCode::NOT_FOUND, "profile not found"),
     };
-    let row: Option<(String, Option<String>, String, String)> = db
+    let row: Option<(String, Option<String>, String, String, String, Option<String>, Option<String>)> = db
         .query_row(
-            "SELECT kind, url, label, owner_id FROM links WHERE id = ?1",
+            "SELECT kind, url, label, owner_id, section, group_title, folder_id FROM links WHERE id = ?1",
             params![link_id],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?)),
         )
         .ok();
-    let (kind, url, label, owner_id) = match row {
+    let (kind, url, label, owner_id, section, group, folder_id) = match row {
         Some(v) => v,
         None => return err_json(StatusCode::NOT_FOUND, "link not found"),
     };
     if kind == "admin" || owner_id != u.id {
         return err_json(StatusCode::NOT_FOUND, "link not found");
+    }
+    if let Some(lt) = link_lock_target(&db, &headers, &owner_id, &section, &group, &folder_id) {
+        return locked_page(&lt, &format!("/u/{username}/go/{link_id}"));
     }
     match url {
         Some(t) if is_container_url(&t) => container_handoff_response(&label, &t),
@@ -2953,10 +3222,14 @@ struct LinkFull {
     group_title: Option<String>,
     folder_id: Option<String>,
     icon_bg: Option<String>,
+    /// Folder rows: a password lock is set on this folder.
+    locked: bool,
+    /// All Apps rows: a password lock is set on this row's group.
+    group_locked: bool,
 }
 
 fn link_full(db: &Connection, id: &str) -> Option<LinkFull> {
-    db.query_row(
+    let l = db.query_row(
         "SELECT id, owner_id, kind, label, url, icon, section, col, row, sort, group_title, folder_id, icon_bg FROM links WHERE id = ?1",
         params![id],
         |r| {
@@ -2977,10 +3250,18 @@ fn link_full(db: &Connection, id: &str) -> Option<LinkFull> {
                 group_title: r.get(10)?,
                 folder_id: r.get(11)?,
                 icon_bg: r.get(12)?,
+                locked: false,
+                group_locked: false,
             })
         },
     )
-    .ok()
+    .ok()?;
+    let locked = l.kind == "folder" && lock_hash_of(db, &l.owner_id, &format!("folder:{}", l.id)).is_some();
+    let group_locked = l.section == "apps" && {
+        let title = l.group_title.clone().unwrap_or_else(|| "Apps".to_string());
+        lock_hash_of(db, &l.owner_id, &format!("group:{}:apps:{title}", l.owner_id)).is_some()
+    };
+    Some(LinkFull { locked, group_locked, ..l })
 }
 
 async fn admin_session(State(st): State<Shared>, headers: HeaderMap) -> Response {
@@ -3430,6 +3711,40 @@ struct LinkInput {
     folder_id: Option<String>,
     /// Optional plate color behind the icon artwork ("#rrggbb").
     icon_bg: Option<String>,
+    /// Locked folders / All Apps groups: set (or, with "", remove) the
+    /// password on the folder this link IS, or on the All Apps group
+    /// this link belongs to. Absent = leave the lock alone.
+    lock_pass: Option<String>,
+}
+
+/// Apply a lock_pass from the editors: target is the folder itself
+/// (kind = folder) or the link's All Apps group.
+fn apply_lock_pass(db: &Connection, owner: &str, kind: &str, section: &str, group: &Option<String>, link_id: &str, lock_pass: &Option<String>) -> Result<(), String> {
+    let pw = match lock_pass {
+        Some(p) => p,
+        None => return Ok(()),
+    };
+    let target = if kind == "folder" {
+        format!("folder:{link_id}")
+    } else if section == "apps" {
+        let title = group.clone().unwrap_or_else(|| "Apps".to_string());
+        format!("group:{owner}:apps:{title}")
+    } else {
+        return Ok(());
+    };
+    if pw.is_empty() {
+        let _ = db.execute("DELETE FROM locks WHERE owner_id = ?1 AND target = ?2", params![owner, target]);
+        return Ok(());
+    }
+    if pw.chars().count() < 4 {
+        return Err("password too short (min 4 characters)".to_string());
+    }
+    let hash = hash_password(pw).map_err(|e| e)?;
+    let _ = db.execute(
+        "INSERT INTO locks(owner_id, target, pass_hash) VALUES(?1, ?2, ?3) ON CONFLICT(owner_id, target) DO UPDATE SET pass_hash = excluded.pass_hash",
+        params![owner, target, hash],
+    );
+    Ok(())
 }
 
 /// Validate a requested folder assignment: the folder must exist, belong to
@@ -3738,6 +4053,7 @@ async fn admin_links_import(State(st): State<Shared>, headers: HeaderMap, Json(i
                 members: None,
                 folder_id: None,
                 icon_bg: None,
+                lock_pass: None,
             };
             let (_o, kind, label, url, icon_mode, icon, section, col, row, sort, group) =
                 match validate_link(&db, &it, &owner, &admin_id) {
@@ -4420,9 +4736,16 @@ fn init_db(data_dir: &FsPath) -> Connection {
          CREATE TABLE IF NOT EXISTS shares(
             id TEXT PRIMARY KEY, token TEXT NOT NULL UNIQUE, link_id TEXT NOT NULL,
             owner_id TEXT NOT NULL, expires_at INTEGER, views INTEGER NOT NULL DEFAULT 0,
-            created_at INTEGER NOT NULL);",
+            created_at INTEGER NOT NULL);
+         CREATE TABLE IF NOT EXISTS locks(
+            owner_id TEXT NOT NULL, target TEXT NOT NULL, pass_hash TEXT NOT NULL,
+            PRIMARY KEY(owner_id, target));",
     )
     .expect("create tables");
+    // Unlock-grant signing secret (locked folders / All Apps groups).
+    if get_setting(&db, "unlock_secret").is_none() {
+        set_setting(&db, "unlock_secret", &random_hex(32));
+    }
     // Report origin (v1.17.3): where the report was filed from
     // ("share:/s/<token>", "profile:/u/<name>" or "startpage").
     {
@@ -4614,6 +4937,7 @@ async fn main() {
         .route("/forgot", get(forgot_page_h).post(forgot))
         .route("/reset", get(reset_page_h).post(reset_password))
         .route("/api/report", post(report_create))
+        .route("/api/unlock", post(api_unlock))
         .route("/logout", post(logout))
         .route("/account", get(account_page))
         // Admin API (admin session + CSRF on mutations)

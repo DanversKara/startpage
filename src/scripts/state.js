@@ -51,8 +51,10 @@ function ensureIconPositions() {
 // the client ever sees.
 function linkItem(x) {
 	const it = { id: x.id, label: x.label, icon: x.icon, icon_bg: x.icon_bg || null, href: '/go/' + encodeURIComponent(x.id) };
+	if (x.locked) { it.locked = true; if (x.lock_target) it.lock_target = x.lock_target; }
 	if (x.folder) {
 		it.folder = true;
+		it.unlocked = !!x.unlocked;
 		it.members = (x.members || []).map(linkItem);
 	}
 	return it;
@@ -73,6 +75,9 @@ async function loadState() {
 			dock: (data.dock || []).map(linkItem),
 			bookmarkSections: [{ blocks: (data.apps || []).map(g => ({
 				title: g.title,
+				locked: !!g.locked,
+				unlocked: !!g.unlocked,
+				lock_target: g.lock_target || null,
 				links: (g.links || []).map(linkItem),
 			})) }],
 			about: (data.about || []).map(g => ({

@@ -29,8 +29,10 @@ function folderPreview(item) {
 
 function makeIconEl(item) {
 	if (item.folder) {
-		const tile = el('div', { class: 'desktop-icon folder-tile', data: { key: item.id }, role: 'button', tabindex: '0' },
-			folderPreview(item),
+		const prev = folderPreview(item);
+		if (item.locked) prev.appendChild(el('span', { class: 'folder-lock-badge', text: '🔒' }));
+		const tile = el('div', { class: 'desktop-icon folder-tile' + (item.locked ? ' locked' : ''), data: { key: item.id }, role: 'button', tabindex: '0' },
+			prev,
 			el('span', { class: 'desktop-icon-label', text: item.label }),
 		);
 		tile.addEventListener('click', () => { if (!desktopEditing) openFolder(item.id); });
@@ -141,6 +143,29 @@ function openFolder(id, keepManage) {
 	const manageBtn = pop.querySelector('.folder-manage-btn');
 	manageBtn.style.display = signedIn ? '' : 'none';
 	manageBtn.textContent = folderManaging ? 'Done' : 'Add apps';
+	if (item.locked && !item.unlocked) {
+		// Locked: the popover is a password gate, nothing else shows.
+		manageBtn.style.display = 'none';
+		pop.querySelector('.folder-actions').style.display = 'none';
+		pop.querySelector('.folder-manage').hidden = true;
+		const grid = pop.querySelector('.folder-grid');
+		grid.style.display = '';
+		grid.innerHTML = '';
+		const pw = el('input', { type: 'password', class: 'ls-input', placeholder: 'Folder password', autocomplete: 'current-password' });
+		const err = el('p', { class: 'ls-msg' });
+		const btn = el('button', { class: 'report-btn primary', type: 'button', text: 'Unlock' });
+		btn.addEventListener('click', async () => {
+			const r = await fetch('/api/unlock', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ target: 'folder:' + id, password: pw.value }) });
+			if (r.ok) { await loadState(); renderDesktopIcons(); openFolder(id); }
+			else err.textContent = 'Wrong password.';
+		});
+		pw.addEventListener('keydown', e => { if (e.key === 'Enter') btn.click(); e.stopPropagation(); });
+		grid.appendChild(el('div', { class: 'folder-lock-form' },
+			el('p', { text: '🔒 This folder is password-protected.' }), pw, err, btn));
+		pop.hidden = false;
+		pw.focus();
+		return;
+	}
 	const manage = pop.querySelector('.folder-manage');
 	manage.hidden = !folderManaging;
 	const grid = pop.querySelector('.folder-grid');
@@ -772,6 +797,18 @@ function ensureLinkSheet() {
 	const groupList = el('datalist', { id: 'lsGroupList' });
 	const groupRow = field('Group', groupIn);
 	groupRow.appendChild(groupList);
+	const passIn = el('input', { class: 'ls-input', type: 'password', placeholder: 'Set a password…', autocomplete: 'new-password' });
+	const passRemove = el('input', { type: 'checkbox' });
+	const passRemoveRow = el('label', { class: 'ls-check' }, passRemove, el('span', { text: 'Remove the password' }));
+	const passRow = field('Folder password', passIn);
+	passRow.appendChild(passRemoveRow);
+	passRow.appendChild(el('p', { class: 'ls-note', text: 'Locks the whole folder: nobody sees or opens what\'s inside without it. Icons show blurred.' }));
+	const gPassIn = el('input', { class: 'ls-input', type: 'password', placeholder: 'Set a password…', autocomplete: 'new-password' });
+	const gPassRemove = el('input', { type: 'checkbox' });
+	const gPassRemoveRow = el('label', { class: 'ls-check' }, gPassRemove, el('span', { text: 'Remove the password' }));
+	const gPassRow = field('Group password', gPassIn);
+	gPassRow.appendChild(gPassRemoveRow);
+	gPassRow.appendChild(el('p', { class: 'ls-note', text: 'Locks this whole All Apps group the same way.' }));
 	const folderSel = el('select', { class: 'ls-input' });
 	const folderRow = field('Folder', folderSel);
 	const iconPrev = el('img', { class: 'ls-icon-prev', alt: '' });
@@ -797,16 +834,16 @@ function ensureLinkSheet() {
 	const cancelBtn = el('button', { class: 'report-btn', type: 'button', text: 'Cancel' });
 	const saveBtn = el('button', { class: 'report-btn primary', type: 'button', text: 'Save' });
 	const card = el('div', { class: 'link-sheet-card' },
-		title, kindRow, field('Name', labelIn), urlRow, sectionRow, folderRow, groupRow, iconRow, bgRow, msg,
+		title, kindRow, field('Name', labelIn), urlRow, sectionRow, folderRow, passRow, groupRow, gPassRow, iconRow, bgRow, msg,
 		el('div', { class: 'report-actions ls-actions' }, delBtn, el('span', { class: 'ls-spacer' }), cancelBtn, saveBtn),
 	);
 	const pop = el('div', { class: 'link-sheet', hidden: true }, card);
 	pop.addEventListener('pointerdown', e => { if (e.target === pop) closeLinkSheet(); });
 	document.body.appendChild(pop);
 	linkSheetEl = pop;
-	pop._f = { title, kindSel, kindRow, labelIn, urlIn, urlRow, sectionSel, sectionRow, folderSel, folderRow, groupIn, groupRow, groupList, iconPrev, iconIn, fileIn, iconRow, bgRow, picker: iconRow.querySelector('.ls-picker'), bgColor, bgIn, msg, delBtn, saveBtn };
-	sectionSel.addEventListener('change', () => { syncLsGroupRow(); syncLsFolderRow(); });
-	kindSel.addEventListener('change', () => syncLsKindRows());
+	pop._f = { title, kindSel, kindRow, labelIn, urlIn, urlRow, sectionSel, sectionRow, folderSel, folderRow, passIn, passRemove, passRemoveRow, passRow, groupIn, groupRow, groupList, gPassIn, gPassRemove, gPassRemoveRow, gPassRow, iconPrev, iconIn, fileIn, iconRow, bgRow, picker: iconRow.querySelector('.ls-picker'), bgColor, bgIn, msg, delBtn, saveBtn };
+	sectionSel.addEventListener('change', () => { syncLsGroupRow(); syncLsFolderRow(); syncLsPassRows(); });
+	kindSel.addEventListener('change', () => { syncLsKindRows(); syncLsPassRows(); });
 	const syncPrev = () => {
 		const v = iconIn.value.trim();
 		iconPrev.src = v || (lsRow ? '/icon/' + lsRow.id : 'src/icons/globe.svg');
@@ -861,6 +898,19 @@ async function buildLsPicker() {
 }
 
 let lsAllLinks = [];
+
+// Password rows: the folder password rides with folder links (editing
+// one, or creating with Type = Folder); the group password rides with
+// All Apps links and locks the link's whole group.
+function syncLsPassRows() {
+	const F = linkSheetEl._f;
+	const isFolderKind = lsRow ? lsRow.kind === 'folder' : F.kindSel.value === 'folder';
+	F.passRow.style.display = isFolderKind ? '' : 'none';
+	F.passRemoveRow.style.display = lsRow && lsRow.locked ? '' : 'none';
+	const isApps = !isFolderKind && F.sectionSel.value === 'apps';
+	F.gPassRow.style.display = isApps ? '' : 'none';
+	F.gPassRemoveRow.style.display = lsRow && lsRow.group_locked ? '' : 'none';
+}
 
 // Create-mode Type picker: a Folder needs only a name — the address,
 // place, folder, group and icon rows all hide.
@@ -936,6 +986,9 @@ async function openLinkSheet(id, presetSection) {
 	F.groupIn.value = row && row.group_title ? row.group_title : '';
 	syncLsGroupRow();
 	syncLsFolderRow();
+	F.passIn.value = ''; F.passRemove.checked = false;
+	F.gPassIn.value = ''; F.gPassRemove.checked = false;
+	syncLsPassRows();
 	F.iconIn.value = row && row.icon_mode !== 'auto' && !String(row.icon || '').startsWith('/icon/') ? row.icon : '';
 	F.bgIn.value = row && row.icon_bg ? row.icon_bg : '';
 	if (F.bgIn.value) F.bgColor.value = F.bgIn.value;
@@ -979,6 +1032,13 @@ async function saveLinkSheet() {
 	// desktop: the select's value is a folder id, or '' for no folder.
 	if (body.section === 'desktop' && !isFolder) body.folder_id = F.folderSel.value;
 	if (body.section === 'apps' || body.section === 'about') body.group_title = F.groupIn.value;
+	if (F.passRow.style.display !== 'none') {
+		if (F.passRemove.checked) body.lock_pass = '';
+		else if (F.passIn.value) body.lock_pass = F.passIn.value;
+	} else if (F.gPassRow.style.display !== 'none') {
+		if (F.gPassRemove.checked) body.lock_pass = '';
+		else if (F.gPassIn.value) body.lock_pass = F.gPassIn.value;
+	}
 	if (!body.label) { F.msg.textContent = 'Give it a name first.'; return; }
 	if (!isFolder && !body.url) { F.msg.textContent = 'Add the address (https://…).'; return; }
 	F.saveBtn.disabled = true;

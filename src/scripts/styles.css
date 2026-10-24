@@ -1262,6 +1262,15 @@ body::after {
 .link-sheet-card select option { background: #23232e; color: #f2f2f5; }
 /* Edit Desktop mode inside All Apps: tiles are editors, not links. */
 .all-apps.editing .miller-link { outline: 1px dashed rgba(255,255,255,.4); outline-offset: 2px; border-radius: 10px; }
+/* Locked folders & groups: previews show, but blurred. */
+.desktop-icon.locked .folder-preview .icon-art { filter: blur(5px) saturate(.5); }
+.folder-preview { position: relative; }
+.folder-lock-badge { position: absolute; top: -5px; right: -5px; font-size: 12px; background: rgba(10,10,16,.8); border-radius: 999px; padding: 2px 5px; }
+.folder-lock-form { grid-column: 1 / -1; display: flex; flex-direction: column; align-items: center; gap: 10px; padding: 14px 8px; text-align: center; }
+.folder-lock-form .ls-input { max-width: 240px; }
+.miller-link.locked .icon-art { filter: blur(4px) saturate(.5); }
+.ls-check { display: flex; align-items: center; gap: 8px; font-size: 13px; color: rgba(235,235,245,.85); margin-top: 8px; cursor: pointer; }
+.ls-note { font-size: 12px; color: rgba(235,235,245,.55); margin: 8px 0 0; line-height: 1.45; }
 .ls-title { margin: 0 0 4px; font-size: 16px; }
 .ls-field { margin-top: 12px; }
 .ls-field > label { display: block; font-size: 11px; font-weight: 600; letter-spacing: .08em; text-transform: uppercase; color: rgba(255,255,255,.55); margin-bottom: 5px; }

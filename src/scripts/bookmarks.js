@@ -24,10 +24,11 @@ function renderMillerCats() {
 		const item = document.createElement('div');
 		item.className  = 'miller-cat';
 		item.dataset.bi = bi;
+		if (c.locked && !c.unlocked) item.classList.add('locked');
 		if (bookmarkQuery && matches === 0) item.classList.add('dim');
 		if (!bookmarkQuery && bi === millerSel) item.classList.add('sel');
 		item.innerHTML = '<span class="miller-cat-ico">' + FOLDER_SVG + '</span>';
-		item.appendChild(el('span', { class: 'miller-cat-label', text: c.title }));
+		item.appendChild(el('span', { class: 'miller-cat-label', text: c.locked && !c.unlocked ? c.title + ' 🔒' : c.title }));
 		item.appendChild(el('span', { class: 'miller-cat-count', text: matches }));
 		item.appendChild(el('span', { class: 'miller-chevron', text: '›' }));
 		col.appendChild(item);
@@ -56,6 +57,16 @@ function renderMillerLinks() {
 		entries.forEach(({ link, cat }) => {
 			const row = el('div', { class: 'miller-link-row' });
 			const art = iconArt(link); art.classList.add('miller-link-ico');
+			if (link.locked) {
+				const a = el('a', { class: 'miller-link locked', href: '#', draggable: false, data: { search: '', key: '' } },
+					art,
+					el('span', { class: 'miller-link-label', text: '🔒 Locked' }),
+				);
+				a.addEventListener('click', e => { e.preventDefault(); openUnlockPrompt(link.lock_target); });
+				row.appendChild(a);
+				col.appendChild(row);
+				return;
+			}
 			const a = el('a', { class: 'miller-link', href: link.href, target: '_blank', rel: 'noopener noreferrer', draggable: false, data: { search: link.label.toLowerCase(), key: link.id } },
 				art,
 				el('span', { class: 'miller-link-label', text: link.label }),
@@ -104,6 +115,45 @@ function filterBookmarks(query) {
 	$('allApps').classList.toggle('searching', !!bookmarkQuery);
 	renderMillerCats();
 	renderMillerLinks();
+}
+
+// ── Locked group unlock ───────────────────────────────────────────────
+// A locked All Apps group renders icon-only placeholders; tapping one
+// asks for the group password here. Success sets the grant cookie, so
+// a state reload brings the real links in.
+let unlockPopEl = null;
+let unlockTarget = null;
+
+function openUnlockPrompt(target) {
+	if (!target) return;
+	unlockTarget = target;
+	if (!unlockPopEl) {
+		const pw = el('input', { type: 'password', class: 'ls-input', placeholder: 'Group password', autocomplete: 'current-password' });
+		const err = el('p', { class: 'ls-msg' });
+		const cancel = el('button', { class: 'report-btn', type: 'button', text: 'Cancel' });
+		const go = el('button', { class: 'report-btn primary', type: 'button', text: 'Unlock' });
+		const card = el('div', { class: 'link-sheet-card' },
+			el('h3', { class: 'ls-title', text: '🔒 Locked group' }),
+			el('p', { class: 'repsub', text: 'This group is password-protected.' }),
+			pw, err,
+			el('div', { class: 'report-actions ls-actions' }, cancel, go),
+		);
+		const pop = el('div', { class: 'link-sheet', hidden: true }, card);
+		pop._f = { pw, err };
+		cancel.addEventListener('click', () => { pop.hidden = true; });
+		pop.addEventListener('pointerdown', e => { if (e.target === pop) pop.hidden = true; });
+		go.addEventListener('click', async () => {
+			const r = await fetch('/api/unlock', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ target: unlockTarget, password: pw.value }) });
+			if (r.ok) { pop.hidden = true; pw.value = ''; await loadState(); renderAllBookmarks(); }
+			else err.textContent = 'Wrong password.';
+		});
+		pw.addEventListener('keydown', e => { if (e.key === 'Enter') go.click(); e.stopPropagation(); });
+		document.body.appendChild(pop);
+		unlockPopEl = pop;
+	}
+	unlockPopEl._f.err.textContent = '';
+	unlockPopEl.hidden = false;
+	unlockPopEl._f.pw.focus();
 }
 
 // ── Bookmark window drag (title-bar) ──────────────────────────────────

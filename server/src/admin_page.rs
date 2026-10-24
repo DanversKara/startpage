@@ -287,6 +287,7 @@ pub fn share_page(
     owner: &str,
     token: &str,
     tiles: &[(String, String, String, Option<String>)],
+    locked: bool,
 ) -> String {
     let e = html_escape_simple;
     let tiles_html: String = tiles
@@ -308,10 +309,29 @@ pub fn share_page(
             )
         })
         .collect();
-    let sub = if is_folder {
+    let sub = if locked {
+        format!("🔒 This folder is password-protected — unlock it to see what's inside. Shared by {}.", e(owner))
+    } else if is_folder {
         format!("A shared folder from {} — tap any app to open it.", e(owner))
     } else {
         format!("Shared by {}", e(owner))
+    };
+    let tiles_html = if locked {
+        let target_js = serde_json::to_string(&format!("folder:{item_id}")).unwrap_or_else(|_| "\"\"".to_string());
+        format!(
+            "<div style=\"text-align:center;width:100%\">\
+             <p style=\"font-size:2em;margin:6px 0\">🔒</p>\
+             <p><input id=\"unlockPw\" type=\"password\" placeholder=\"Folder password\" autocomplete=\"current-password\" \
+             style=\"width:min(260px,80%);padding:.65em;border-radius:10px;border:1px solid rgba(255,255,255,.25);background:rgba(255,255,255,.06);color:#fff;font-size:1em\"></p>\
+             <p id=\"unlockErr\" style=\"color:#ff9d9d;min-height:1.2em\"></p>\
+             <p><button id=\"unlockBtn\" style=\"background:#2f6bff;color:#fff;padding:.65em 1.4em;border:0;border-radius:12px;font-weight:600;cursor:pointer\">Unlock</button></p></div>\
+             <script>var UTARGET = {target_js};\
+             async function doUnlock() {{ var r = await fetch('/api/unlock', {{ method: 'POST', headers: {{ 'Content-Type': 'application/json' }}, body: JSON.stringify({{ target: UTARGET, password: document.getElementById('unlockPw').value }}) }}); if (r.ok) {{ location.reload(); }} else {{ document.getElementById('unlockErr').textContent = 'Wrong password.'; }} }}\
+             document.getElementById('unlockBtn').addEventListener('click', doUnlock);\
+             document.getElementById('unlockPw').addEventListener('keydown', function (ev) {{ if (ev.key === 'Enter') doUnlock(); }});</script>"
+        )
+    } else {
+        tiles_html
     };
     let mode = if is_folder { "grid" } else { "grid single" };
     r#"<!doctype html><html><head><meta charset="utf-8">
