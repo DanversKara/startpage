@@ -35,6 +35,22 @@ This edition adds a small **Rust** service (`server/`, binary
   panel's Bundled-icon dropdown.
 - **Branding is server-side** (product name, tagline, About note, profile
   block) and starts out identical to the upstream About card.
+- **Per-user wallpapers (v1.19.0):** the menu-bar Wallpaper button opens a
+  picker (bundled default, shared library, your own uploads — up to 8 MB,
+  type-checked). Your choice is yours alone; visitors see the public
+  owner's wallpaper. Any visitor or user can report a wallpaper from the
+  picker; reports land in the panel's Reports card with a one-click
+  removal, and the panel has a Wallpapers card for the shared library.
+- **Wallpaper rotation (v1.20.0):** toggle tiles into a rotation set (up
+  to 20) and choose timed (every N seconds, minimum 10) or a new one on
+  every refresh. Rotation is a display override — your stored wallpaper
+  stays the fallback, and picking a wallpaper by hand stops rotation.
+  Deleting a wallpaper scrubs it from every rotation set automatically.
+- **Upload size fix (v1.20.1):** the server's JSON body cap is raised to
+  16 MB (from axum's 2 MB default) so 8 MB wallpapers actually upload
+  instead of dying with a bare HTTP 413; both uploaders also check the
+  8 MB limit in the browser first, so an oversized file gets a clear
+  message instead of a round trip.
 
 ## Security model — and its honest limits
 

@@ -8,6 +8,7 @@ function setupEvents() {
 		$('allApps').classList.contains('open') ? closeAllApps() : openAllBookmarks();
 	});
 	$('mbBrand').addEventListener('click', e => { e.stopPropagation(); toggleAboutPanel(); });
+	$('mbWallpaper').addEventListener('click', () => { toggleWallpaperPanel(); });
 
 	$('dock').addEventListener('click', e => {
 		const launch = e.target.closest('.dock-icon, .dock-all-apps');
@@ -155,6 +156,8 @@ async function setupAccountLine() {
 // ─────────────────────────────────────────────────────────────────────
 (async function init() {
 	await loadState();
+	applyWallpaper(S.wallpaper);
+	applyRotationAtBoot();
 	renderDesktopIcons();
 	renderDock();
 	renderAbout();

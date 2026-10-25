@@ -16,7 +16,7 @@
 
 use axum::{
     body::Body,
-    extract::{ConnectInfo, Path, Query, State},
+    extract::{ConnectInfo, DefaultBodyLimit, Path, Query, State},
     http::{header, HeaderMap, HeaderValue, StatusCode},
     response::{IntoResponse, Response},
     routing::{delete, get, post, put},
@@ -285,8 +285,7 @@ fn link_lock_target(db: &Connection, headers: &HeaderMap, owner: &str, section: 
         let t = format!("folder:{fid}");
         if lock_hash_of(db, owner, &t).is_some() { Some(t) } else { None }
     } else if section == "apps" {
-        let title = group_title.clone().unwrap_or_else(|| "Apps".to_string());
-        let t = format!("group:{owner}:apps:{title}");
+        let t = group_lock_target(owner, group_title);
         if lock_hash_of(db, owner, &t).is_some() { Some(t) } else { None }
     } else {
         None
@@ -674,6 +673,17 @@ fn viewer_owner(st: &Shared, headers: &HeaderMap) -> Option<String> {
 // ─────────────────────────────────────────────────────────────────────
 async fn api_state(State(st): State<Shared>, headers: HeaderMap) -> Response {
     let owner = viewer_owner(&st, &headers);
+    // The desktop background for whoever is viewing: the signed-in
+    // user's choice, else the public owner's choice, else default.
+    let wallpaper: Option<String> = owner.as_deref().and_then(|oid| {
+        let db = st.db.lock().unwrap();
+        wallpaper_for(&db, &st.data_dir, oid)
+    });
+    // Rotation for whoever is viewing (their own, else the owner's).
+    let rotation: serde_json::Value = owner.as_deref().map(|oid| {
+        let db = st.db.lock().unwrap();
+        rotation_for(&db, oid)
+    }).unwrap_or(serde_json::json!({ "mode": "off", "seconds": 60, "paths": [] }));
     let mut desktop = Vec::new();
     let mut dock = Vec::new();
     let mut apps: Vec<(String, Vec<serde_json::Value>, Option<(bool, String)>)> = Vec::new();
@@ -734,7 +744,7 @@ async fn api_state(State(st): State<Shared>, headers: HeaderMap) -> Response {
                     // All Apps group: a locked group sends icon-only
                     // placeholders (no id, no label) until unlocked.
                     let title = l.group.clone().unwrap_or_else(|| "Apps".to_string());
-                    let g_target = format!("group:{owner}:apps:{title}");
+                    let g_target = group_lock_target(&owner, &l.group);
                     let g_locked = lock_hash_of(&db, &owner, &g_target).is_some();
                     let g_unlocked = g_locked && grants.contains(&g_target);
                     let shown = if g_locked && !g_unlocked {
@@ -777,7 +787,8 @@ async fn api_state(State(st): State<Shared>, headers: HeaderMap) -> Response {
         })
         .collect();
     json_response(StatusCode::OK, serde_json::json!({
-        "desktop": desktop, "dock": dock, "apps": apps_json, "about": group(about), "branding": branding
+        "desktop": desktop, "dock": dock, "apps": apps_json, "about": group(about), "branding": branding,
+        "wallpaper": wallpaper, "rotation": rotation
     }))
 }
 
@@ -1327,7 +1338,7 @@ fn sync_payload(db: &Connection, owner: &str) -> serde_json::Value {
             _ => {
                 // Locked All Apps groups sync as an empty, flagged group.
                 let title = l.group.clone().unwrap_or_else(|| "Apps".to_string());
-                let g_target = format!("group:{owner}:apps:{title}");
+                let g_target = group_lock_target(owner, &l.group);
                 if lock_hash_of(db, owner, &g_target).is_some() {
                     if !apps.iter().any(|(t, _)| *t == title) {
                         apps.push((title, Vec::new()));
@@ -1860,6 +1871,10 @@ async fn reset_password(
 struct ReportReq {
     link_id: Option<String>,
     username: Option<String>,
+    /// A wallpaper report: the wallpaper's public path
+    /// ("/wallpapers/<file>"). Validated server-side against the
+    /// wallpapers dir; anything else is rejected, never stored.
+    wallpaper: Option<String>,
     reason: Option<String>,
     /// Where the report was filed from: a share landing page (token)
     /// or a profile page (owner username). Validated server-side
@@ -1892,7 +1907,69 @@ async fn report_create(
     // the item's address, so the notification email can tell apart two
     // users' identically-named links (v1.17.2).
     let base = request_base(&headers);
-    let (label, owner, stored_link_id, owner_name, address, link_folder_id) = match body
+    let (label, owner, stored_link_id, owner_name, address, link_folder_id, target) = if let Some(wp) = body
+        .wallpaper
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        // A wallpaper report: the path must be a real uploaded
+        // wallpaper ("/wallpapers/<file>"). The bundled default is
+        // not reportable — it is the product's own asset.
+        let file = match wp.strip_prefix("/wallpapers/") {
+            Some(f) if is_icon_filename(f) => f.to_string(),
+            _ => return err_json(StatusCode::BAD_REQUEST, "not a wallpaper"),
+        };
+        if !st.data_dir.join("uploads/wallpapers").join(&file).exists() {
+            return err_json(StatusCode::NOT_FOUND, "wallpaper not found");
+        }
+        let user_ids: Vec<String> = {
+            let mut stmt = match db.prepare("SELECT id FROM users") {
+                Ok(s) => s,
+                Err(_) => return err_json(StatusCode::INTERNAL_SERVER_ERROR, "db error"),
+            };
+            let m = stmt.query_map([], |r| r.get::<_, String>(0));
+            match m {
+                Ok(q) => q.filter_map(|x| x.ok()).collect(),
+                Err(_) => Vec::new(),
+            }
+        };
+        // Personal uploads carry their uploader (u<id>-…); anything
+        // else is shared library, owned by the first admin.
+        let personal = user_ids.iter().find(|uid| file.starts_with(&format!("u{uid}-")));
+        let (owner, owner_name) = match personal {
+            Some(uid) => {
+                let name: Option<String> = db
+                    .query_row("SELECT username FROM users WHERE id = ?1", params![uid], |r| r.get(0))
+                    .ok();
+                match name {
+                    Some(n) => (uid.clone(), n),
+                    None => return err_json(StatusCode::NOT_FOUND, "wallpaper owner not found"),
+                }
+            }
+            None => {
+                match db
+                    .query_row("SELECT id, username FROM users WHERE role = 'admin' ORDER BY created_at LIMIT 1", [], |r| {
+                        Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+                    })
+                    .ok()
+                {
+                    Some((id, name)) => (id, name),
+                    None => (String::new(), "unknown".to_string()),
+                }
+            }
+        };
+        (
+            format!("wallpaper: {file}"),
+            owner,
+            String::new(),
+            owner_name,
+            format!("{base}{wp}"),
+            None,
+            Some(wp.to_string()),
+        )
+    } else {
+        match body
         .username
         .as_deref()
         .map(str::trim)
@@ -1913,6 +1990,7 @@ async fn report_create(
                     String::new(),
                     canonical.clone(),
                     format!("{base}/u/{canonical}"),
+                    None,
                     None,
                 ),
                 None => return err_json(StatusCode::NOT_FOUND, "user not found"),
@@ -1935,15 +2013,18 @@ async fn report_create(
                         None if kind == "folder" => "(a folder — no web address)".to_string(),
                         None => "(no address)".to_string(),
                     };
-                    (label, owner, link_id, owner_name, address, folder_id)
+                    (label, owner, link_id, owner_name, address, folder_id, None)
                 }
                 None => return err_json(StatusCode::NOT_FOUND, "link not found"),
             }
         }
+        }
     };
     // Where was it reported FROM? Claims are validated against the
     // item itself, so a forged context is ignored, never stored.
-    let source: String = if stored_link_id.is_empty() {
+    let source: String = if target.is_some() {
+        "wallpaper".to_string()
+    } else if stored_link_id.is_empty() {
         format!("profile:/u/{owner_name}")
     } else if let Some(tok) = body.share_token.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
         match share_by_token(&db, tok) {
@@ -1975,8 +2056,8 @@ async fn report_create(
         return err_json(StatusCode::TOO_MANY_REQUESTS, "too many reports — try again later");
     }
     let _ = db.execute(
-        "INSERT INTO reports(id, link_id, label, owner_id, reporter, reason, ip, status, created_at, source) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, 'open', ?8, ?9)",
-        params![random_id(), stored_link_id, label.clone(), owner, reporter.clone(), reason.clone(), ip, now_secs(), source.clone()],
+        "INSERT INTO reports(id, link_id, label, owner_id, reporter, reason, ip, status, created_at, source, target) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, 'open', ?8, ?9, ?10)",
+        params![random_id(), stored_link_id, label.clone(), owner, reporter.clone(), reason.clone(), ip, now_secs(), source.clone(), target],
     );
     // Email the admins (spawned — the panel remains the record if mail fails).
     let admin_emails: Vec<String> = db
@@ -1991,6 +2072,8 @@ async fn report_create(
             format!("{base}{p} (share link)")
         } else if let Some(p) = source.strip_prefix("profile:") {
             format!("{base}{p} (profile page)")
+        } else if source == "wallpaper" {
+            "a wallpaper".to_string()
         } else {
             "the public startpage".to_string()
         };
@@ -2010,7 +2093,7 @@ async fn admin_reports(State(st): State<Shared>, headers: HeaderMap) -> Response
     }
     let db = st.db.lock().unwrap();
     let mut stmt = match db.prepare(
-        "SELECT r.id, r.link_id, r.label, r.reporter, r.reason, r.status, r.created_at, COALESCE(u.username, 'unknown'), l.icon, l.url, r.source \
+        "SELECT r.id, r.link_id, r.label, r.reporter, r.reason, r.status, r.created_at, COALESCE(u.username, 'unknown'), l.icon, l.url, r.source, r.target \
          FROM reports r LEFT JOIN users u ON u.id = r.owner_id LEFT JOIN links l ON l.id = r.link_id ORDER BY r.created_at DESC LIMIT 100",
     ) {
         Ok(s) => s,
@@ -2025,7 +2108,7 @@ async fn admin_reports(State(st): State<Shared>, headers: HeaderMap) -> Response
                 "reporter": r.get::<_, String>(3)?, "reason": r.get::<_, String>(4)?, "status": r.get::<_, String>(5)?,
                 "created_at": r.get::<_, i64>(6)?, "owner": r.get::<_, String>(7)?,
                 "icon": icon, "icon_upload": icon_upload, "url": r.get::<_, Option<String>>(9)?,
-                "source": r.get::<_, Option<String>>(10)?
+                "source": r.get::<_, Option<String>>(10)?, "target": r.get::<_, Option<String>>(11)?
             }))
         })
         .map(|q| q.filter_map(|x| x.ok()).collect())
@@ -2073,6 +2156,44 @@ async fn admin_report_remove_icon(
     if let Some(file) = icon.strip_prefix("/uploads/") {
         if is_icon_filename(file) {
             let _ = std::fs::remove_file(st.data_dir.join("uploads/icons").join(file));
+        }
+    }
+    admin_json(StatusCode::OK, serde_json::json!({ "ok": true }))
+}
+
+/// One-click answer to a wallpaper report (v1.19.0): delete the
+/// reported wallpaper file, clear every user's choice pointing at it
+/// (they fall back to the default), and resolve the report.
+async fn admin_report_remove_wallpaper(
+    State(st): State<Shared>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Response {
+    let sess = match require_admin(&st, &headers) {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
+    if let Err(r) = require_csrf(&sess, &headers) {
+        return r;
+    }
+    let target = {
+        let db = st.db.lock().unwrap();
+        let target: Option<String> = db
+            .query_row("SELECT target FROM reports WHERE id = ?1", params![id], |r| r.get(0))
+            .ok()
+            .flatten();
+        let target = match target.filter(|t| !t.is_empty()) {
+            Some(t) => t,
+            None => return admin_json(StatusCode::NOT_FOUND, serde_json::json!({ "error": "report or wallpaper not found" })),
+        };
+        let _ = db.execute("UPDATE users SET wallpaper_path = NULL WHERE wallpaper_path = ?1", params![target]);
+        scrub_rotation_path(&db, &target);
+        let _ = db.execute("UPDATE reports SET status = 'resolved' WHERE id = ?1", params![id]);
+        target
+    };
+    if let Some(file) = target.strip_prefix("/wallpapers/") {
+        if is_icon_filename(file) {
+            let _ = std::fs::remove_file(st.data_dir.join("uploads/wallpapers").join(file));
         }
     }
     admin_json(StatusCode::OK, serde_json::json!({ "ok": true }))
@@ -2519,6 +2640,10 @@ async fn me_links_update(State(st): State<Shared>, headers: HeaderMap, Path(id):
         if let Err(msg) = apply_lock_pass(&db, &sess.user.id, &kind, &section, &group, &id, &input.lock_pass) {
             return admin_json(StatusCode::BAD_REQUEST, serde_json::json!({ "error": msg }));
         }
+        // v1.18.1: a rename that empties the old group must not orphan its lock.
+        if existing.section == "apps" && section == "apps" {
+            migrate_group_lock(&db, &sess.user.id, &existing.group_title, &group);
+        }
         if icon_mode == "auto" && kind == "url" { url } else { None }
     };
     if let Some(u) = fetch {
@@ -2650,6 +2775,364 @@ async fn me_icons_upload(State(st): State<Shared>, headers: HeaderMap, Json(inpu
         Ok(()) => admin_json(StatusCode::OK, serde_json::json!({ "ok": true, "path": format!("/uploads/{stored}") })),
         Err(e) => admin_json(StatusCode::INTERNAL_SERVER_ERROR, serde_json::json!({ "error": format!("write failed: {e}") })),
     }
+}
+
+// ── Per-user wallpapers (v1.19.0) ───────────────────────────────
+// Same sniff/size discipline as the icon uploads, but the limit is
+// higher (photos, not icons) and the files live in their own dir
+// (uploads/wallpapers, served at /wallpapers/<file>) so they never
+// pollute the icon picker. Names follow the icon convention:
+// personal uploads are namespaced u<user-id>-<file>; panel uploads
+// are the shared library everyone can pick from. A user's choice is
+// their users.wallpaper_path (NULL = the bundled default); the
+// public desktop shows the default owner's choice.
+
+/// The effective wallpaper for a user id: their stored choice, but
+/// only if the file still exists — otherwise the bundled default.
+fn wallpaper_for(db: &Connection, data_dir: &std::path::Path, user_id: &str) -> Option<String> {
+    let path: Option<String> = db
+        .query_row("SELECT wallpaper_path FROM users WHERE id = ?1", params![user_id], |r| r.get(0))
+        .ok()
+        .flatten();
+    let path = path.filter(|p| !p.is_empty())?;
+    let file = path.strip_prefix("/wallpapers/")?;
+    if !is_icon_filename(file) {
+        return None;
+    }
+    if data_dir.join("uploads/wallpapers").join(file).exists() {
+        Some(path)
+    } else {
+        None
+    }
+}
+
+async fn me_wallpapers_list(State(st): State<Shared>, headers: HeaderMap) -> Response {
+    // Public, like /api/state: visitors see the list so they can
+    // report the wallpaper on the public desktop. Upload/choose/
+    // delete below still require a session.
+    let sess = session_from_headers(&st, &headers);
+    let db = st.db.lock().unwrap();
+    let user_ids: Vec<String> = {
+        let mut stmt = match db.prepare("SELECT id FROM users") {
+            Ok(s) => s,
+            Err(_) => return admin_json(StatusCode::INTERNAL_SERVER_ERROR, serde_json::json!({ "error": "db error" })),
+        };
+        let m = stmt.query_map([], |r| r.get::<_, String>(0));
+        match m {
+            Ok(q) => q.filter_map(|x| x.ok()).collect(),
+            Err(_) => Vec::new(),
+        }
+    };
+    // Whose desktop is being viewed: the signed-in user, else the
+    // public (default) owner. Their current wallpaper is always
+    // listed, even when it is a personal upload a visitor could not
+    // otherwise see — it is the wallpaper on screen, and reportable.
+    let (viewer_id, owner_id) = match &sess {
+        Some(s) => (Some(s.user.id.clone()), s.user.id.clone()),
+        None => (None, default_owner(&db).unwrap_or_default()),
+    };
+    let current = if owner_id.is_empty() {
+        None
+    } else {
+        wallpaper_for(&db, &st.data_dir, &owner_id)
+    };
+    drop(db);
+    let own_prefix = viewer_id.as_deref().map(|id| format!("u{}-", id));
+    let mut items: Vec<serde_json::Value> = Vec::new();
+    // The bundled default first: it is always available, and it is
+    // the "no choice" state a user reverts to.
+    items.push(serde_json::json!({
+        "path": null, "thumb": "src/background.jpeg", "name": "Default",
+        "mine": false, "library": false, "default": true
+    }));
+    if let Ok(rd) = std::fs::read_dir(st.data_dir.join("uploads/wallpapers")) {
+        for ent in rd.flatten() {
+            let name = ent.file_name().to_string_lossy().to_string();
+            if !is_icon_filename(&name) {
+                continue;
+            }
+            let mine = own_prefix.as_deref().map(|p| name.starts_with(p)).unwrap_or(false);
+            let personal = user_ids.iter().any(|uid| name.starts_with(&format!("u{}-", uid)));
+            if personal && !mine && current.as_deref() != Some(&format!("/wallpapers/{}", name)) {
+                // Someone else's personal upload — private, unless it
+                // is the wallpaper currently on screen (see above).
+                continue;
+            }
+            // Display name hides the u<id>- namespace prefix.
+            let display = user_ids
+                .iter()
+                .find(|uid| name.starts_with(&format!("u{}-", uid)))
+                .map(|uid| name.strip_prefix(&format!("u{}-", uid)).unwrap_or(&name).to_string())
+                .unwrap_or_else(|| name.clone());
+            items.push(serde_json::json!({
+                "path": format!("/wallpapers/{}", name), "thumb": format!("/wallpapers/{}", name),
+                "name": display, "mine": mine, "library": !personal, "default": false
+            }));
+        }
+    }
+    items.sort_by(|a, b| {
+        // Default first, then library, then own uploads, each by name.
+        let rank = |v: &serde_json::Value| {
+            if v["default"].as_bool().unwrap_or(false) { 0 }
+            else if v["library"].as_bool().unwrap_or(false) { 1 }
+            else { 2 }
+        };
+        rank(a).cmp(&rank(b)).then(a["name"].as_str().unwrap_or("").cmp(b["name"].as_str().unwrap_or("")))
+    });
+    admin_json(StatusCode::OK, serde_json::json!({ "current": current, "items": items }))
+}
+
+async fn me_wallpapers_upload(State(st): State<Shared>, headers: HeaderMap, Json(input): Json<IconUploadReq>) -> Response {
+    let sess = match require_session(&st, &headers) {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
+    if let Err(r) = require_csrf(&sess, &headers) {
+        return r;
+    }
+    let name = match sanitize_icon_name(&input.filename) {
+        Some(n) => n,
+        None => return admin_json(StatusCode::BAD_REQUEST, serde_json::json!({ "error": "filename must end in .png, .svg, .ico, .jpg, .jpeg, .webp or .gif" })),
+    };
+    let stored = format!("u{}-{}", sess.user.id, name);
+    let cleaned_b64: String = input.data_base64.chars().filter(|c| !c.is_whitespace()).collect();
+    let payload = cleaned_b64.rsplit(',').next().unwrap_or("");
+    use base64::Engine;
+    let bytes = match base64::engine::general_purpose::STANDARD.decode(payload) {
+        Ok(b) => b,
+        Err(_) => return admin_json(StatusCode::BAD_REQUEST, serde_json::json!({ "error": "could not decode the file data" })),
+    };
+    if bytes.is_empty() || bytes.len() > 8 * 1024 * 1024 {
+        return admin_json(StatusCode::BAD_REQUEST, serde_json::json!({ "error": "wallpaper must be between 1 byte and 8 MB" }));
+    }
+    let ext = stored.rsplit('.').next().unwrap_or("").to_lowercase();
+    if !icon_content_matches(&ext, &bytes) {
+        return admin_json(StatusCode::BAD_REQUEST, serde_json::json!({ "error": "the file's content does not match its extension" }));
+    }
+    let dir = st.data_dir.join("uploads/wallpapers");
+    if std::fs::create_dir_all(&dir).is_err() {
+        return admin_json(StatusCode::INTERNAL_SERVER_ERROR, serde_json::json!({ "error": "could not create the uploads dir" }));
+    }
+    match std::fs::write(dir.join(&stored), &bytes) {
+        Ok(()) => admin_json(StatusCode::OK, serde_json::json!({ "ok": true, "path": format!("/wallpapers/{}", stored) })),
+        Err(e) => admin_json(StatusCode::INTERNAL_SERVER_ERROR, serde_json::json!({ "error": format!("write failed: {e}") })),
+    }
+}
+
+#[derive(Deserialize)]
+struct WallpaperChooseReq {
+    path: Option<String>,
+}
+
+async fn me_wallpapers_choose(State(st): State<Shared>, headers: HeaderMap, Json(input): Json<WallpaperChooseReq>) -> Response {
+    let sess = match require_session(&st, &headers) {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
+    if let Err(r) = require_csrf(&sess, &headers) {
+        return r;
+    }
+    let path = match input.path.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        None => None,
+        Some(p) => {
+            // Only the default, a shared library wallpaper, or the
+            // caller's own upload — never another user's personal one.
+            let file = match p.strip_prefix("/wallpapers/") {
+                Some(f) if is_icon_filename(f) => f,
+                _ => return admin_json(StatusCode::BAD_REQUEST, serde_json::json!({ "error": "not a wallpaper" })),
+            };
+            if !st.data_dir.join("uploads/wallpapers").join(file).exists() {
+                return admin_json(StatusCode::NOT_FOUND, serde_json::json!({ "error": "wallpaper not found" }));
+            }
+            let own_prefix = format!("u{}-", sess.user.id);
+            let db = st.db.lock().unwrap();
+            let user_ids: Vec<String> = {
+                let mut stmt = match db.prepare("SELECT id FROM users") {
+                    Ok(s) => s,
+                    Err(_) => return admin_json(StatusCode::INTERNAL_SERVER_ERROR, serde_json::json!({ "error": "db error" })),
+                };
+                let m = stmt.query_map([], |r| r.get::<_, String>(0));
+                match m {
+                    Ok(q) => q.filter_map(|x| x.ok()).collect(),
+                    Err(_) => Vec::new(),
+                }
+            };
+            let personal = user_ids.iter().any(|uid| file.starts_with(&format!("u{}-", uid)));
+            if personal && !file.starts_with(&own_prefix) {
+                return admin_json(StatusCode::FORBIDDEN, serde_json::json!({ "error": "that wallpaper belongs to someone else" }));
+            }
+            Some(p.to_string())
+        }
+    };
+    let db = st.db.lock().unwrap();
+    let _ = db.execute(
+        "UPDATE users SET wallpaper_path = ?1 WHERE id = ?2",
+        params![path.as_deref(), sess.user.id],
+    );
+    admin_json(StatusCode::OK, serde_json::json!({ "ok": true, "path": path }))
+}
+
+#[derive(Deserialize)]
+struct WallpaperDeleteReq {
+    path: String,
+}
+
+async fn me_wallpapers_delete(State(st): State<Shared>, headers: HeaderMap, Json(input): Json<WallpaperDeleteReq>) -> Response {
+    let sess = match require_session(&st, &headers) {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
+    if let Err(r) = require_csrf(&sess, &headers) {
+        return r;
+    }
+    // Only the caller's own uploads can be deleted here; library
+    // wallpapers are the admin's (panel), and other users' uploads
+    // are never listed to the caller in the first place.
+    let file = match input.path.strip_prefix("/wallpapers/") {
+        Some(f) if is_icon_filename(f) => f.to_string(),
+        _ => return admin_json(StatusCode::BAD_REQUEST, serde_json::json!({ "error": "not a wallpaper" })),
+    };
+    let own_prefix = format!("u{}-", sess.user.id);
+    if !file.starts_with(&own_prefix) {
+        return admin_json(StatusCode::FORBIDDEN, serde_json::json!({ "error": "you can only delete your own wallpapers" }));
+    }
+    match std::fs::remove_file(st.data_dir.join("uploads/wallpapers").join(&file)) {
+        Ok(()) => {
+            let db = st.db.lock().unwrap();
+            let _ = db.execute("UPDATE users SET wallpaper_path = NULL WHERE wallpaper_path = ?1", params![input.path]);
+            scrub_rotation_path(&db, &input.path);
+            admin_json(StatusCode::OK, serde_json::json!({ "ok": true }))
+        }
+        Err(_) => admin_json(StatusCode::NOT_FOUND, serde_json::json!({ "error": "no such wallpaper" })),
+    }
+}
+
+// ── Wallpaper rotation (v1.20.0) ───────────────────────────────
+// A user's rotation is one JSON blob on their row: {mode, seconds,
+// paths[]} with mode off|timed|refresh. Timed cycles the set on the
+// client every N seconds; refresh picks a random set member on each
+// page load (there is deliberately no localStorage to remember a
+// round-robin position in). The stored wallpaper_path stays the
+// fallback whenever rotation is off or the set is empty.
+
+/// A user's rotation settings: missing or malformed storage = off.
+fn rotation_for(db: &Connection, user_id: &str) -> serde_json::Value {
+    let raw: Option<String> = db
+        .query_row("SELECT rotation_json FROM users WHERE id = ?1", params![user_id], |r| r.get(0))
+        .ok()
+        .flatten();
+    let v: serde_json::Value = raw.and_then(|s| serde_json::from_str(&s).ok()).unwrap_or(serde_json::json!({}));
+    let mode = v["mode"].as_str().unwrap_or("off");
+    let mode = if ["off", "timed", "refresh"].contains(&mode) { mode } else { "off" };
+    let seconds = v["seconds"].as_i64().unwrap_or(60).clamp(10, 86400);
+    let paths: Vec<String> = v["paths"]
+        .as_array()
+        .map(|a| a.iter().filter_map(|p| p.as_str().map(|s| s.to_string())).collect())
+        .unwrap_or_default();
+    serde_json::json!({ "mode": mode, "seconds": seconds, "paths": paths })
+}
+
+/// Remove a deleted wallpaper from every user's rotation set (and
+/// switch rotation off if the set empties), so a delete can never
+/// leave a rotation pointing at a missing file.
+fn scrub_rotation_path(db: &Connection, path: &str) {
+    let rows: Vec<(String, String)> = {
+        let mut stmt = match db.prepare("SELECT id, rotation_json FROM users WHERE rotation_json IS NOT NULL") {
+            Ok(s) => s,
+            Err(_) => return,
+        };
+        let m = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)));
+        match m {
+            Ok(q) => q.filter_map(|x| x.ok()).collect(),
+            Err(_) => Vec::new(),
+        }
+    };
+    for (uid, raw) in rows {
+        let mut v: serde_json::Value = match serde_json::from_str(&raw) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        let before = v["paths"].as_array().map(|a| a.len()).unwrap_or(0);
+        let paths: Vec<serde_json::Value> = v["paths"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|p| p.as_str() != Some(path))
+            .collect();
+        if paths.len() == before {
+            continue;
+        }
+        v["paths"] = serde_json::Value::Array(paths);
+        if v["paths"].as_array().map(|a| a.is_empty()).unwrap_or(false) {
+            v["mode"] = serde_json::json!("off");
+        }
+        let _ = db.execute("UPDATE users SET rotation_json = ?1 WHERE id = ?2", params![v.to_string(), uid]);
+    }
+}
+
+#[derive(Deserialize)]
+struct RotationReq {
+    mode: String,
+    seconds: Option<i64>,
+    paths: Vec<String>,
+}
+
+async fn me_wallpapers_rotation(State(st): State<Shared>, headers: HeaderMap, Json(input): Json<RotationReq>) -> Response {
+    let sess = match require_session(&st, &headers) {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
+    if let Err(r) = require_csrf(&sess, &headers) {
+        return r;
+    }
+    let mode = input.mode.as_str();
+    if !["off", "timed", "refresh"].contains(&mode) {
+        return admin_json(StatusCode::BAD_REQUEST, serde_json::json!({ "error": "mode must be off, timed or refresh" }));
+    }
+    let seconds = input.seconds.unwrap_or(60).clamp(10, 86400);
+    if input.paths.len() > 20 {
+        return admin_json(StatusCode::BAD_REQUEST, serde_json::json!({ "error": "at most 20 wallpapers in a rotation set" }));
+    }
+    // Every path must be a real wallpaper the caller may use:
+    // shared library or their own upload, never someone else's.
+    let own_prefix = format!("u{}-", sess.user.id);
+    let db = st.db.lock().unwrap();
+    let user_ids: Vec<String> = {
+        let mut stmt = match db.prepare("SELECT id FROM users") {
+            Ok(s) => s,
+            Err(_) => return admin_json(StatusCode::INTERNAL_SERVER_ERROR, serde_json::json!({ "error": "db error" })),
+        };
+        let m = stmt.query_map([], |r| r.get::<_, String>(0));
+        match m {
+            Ok(q) => q.filter_map(|x| x.ok()).collect(),
+            Err(_) => Vec::new(),
+        }
+    };
+    let mut clean: Vec<String> = Vec::new();
+    for p in &input.paths {
+        let file = match p.strip_prefix("/wallpapers/") {
+            Some(f) if is_icon_filename(f) => f,
+            _ => return admin_json(StatusCode::BAD_REQUEST, serde_json::json!({ "error": "not a wallpaper" })),
+        };
+        if !st.data_dir.join("uploads/wallpapers").join(file).exists() {
+            return admin_json(StatusCode::NOT_FOUND, serde_json::json!({ "error": "a wallpaper in the set no longer exists" }));
+        }
+        let personal = user_ids.iter().any(|uid| file.starts_with(&format!("u{}-", uid)));
+        if personal && !file.starts_with(&own_prefix) {
+            return admin_json(StatusCode::FORBIDDEN, serde_json::json!({ "error": "the set contains someone else's wallpaper" }));
+        }
+        clean.push(p.clone());
+    }
+    // Dedupe, keeping the caller's order (that order is the cycle).
+    let mut seen = std::collections::HashSet::new();
+    clean.retain(|p| seen.insert(p.clone()));
+    if mode != "off" && clean.is_empty() {
+        return admin_json(StatusCode::BAD_REQUEST, serde_json::json!({ "error": "pick at least one wallpaper for rotation" }));
+    }
+    let stored = serde_json::json!({ "mode": mode, "seconds": seconds, "paths": clean });
+    let _ = db.execute("UPDATE users SET rotation_json = ?1 WHERE id = ?2", params![stored.to_string(), sess.user.id]);
+    admin_json(StatusCode::OK, serde_json::json!({ "ok": true, "rotation": stored }))
 }
 
 async fn me_shares_list(State(st): State<Shared>, headers: HeaderMap) -> Response {
@@ -3257,10 +3740,8 @@ fn link_full(db: &Connection, id: &str) -> Option<LinkFull> {
     )
     .ok()?;
     let locked = l.kind == "folder" && lock_hash_of(db, &l.owner_id, &format!("folder:{}", l.id)).is_some();
-    let group_locked = l.section == "apps" && {
-        let title = l.group_title.clone().unwrap_or_else(|| "Apps".to_string());
-        lock_hash_of(db, &l.owner_id, &format!("group:{}:apps:{title}", l.owner_id)).is_some()
-    };
+    let group_locked = l.section == "apps"
+        && lock_hash_of(db, &l.owner_id, &group_lock_target(&l.owner_id, &l.group_title)).is_some();
     Some(LinkFull { locked, group_locked, ..l })
 }
 
@@ -3727,8 +4208,7 @@ fn apply_lock_pass(db: &Connection, owner: &str, kind: &str, section: &str, grou
     let target = if kind == "folder" {
         format!("folder:{link_id}")
     } else if section == "apps" {
-        let title = group.clone().unwrap_or_else(|| "Apps".to_string());
-        format!("group:{owner}:apps:{title}")
+        group_lock_target(owner, group)
     } else {
         return Ok(());
     };
@@ -3745,6 +4225,47 @@ fn apply_lock_pass(db: &Connection, owner: &str, kind: &str, section: &str, grou
         params![owner, target, hash],
     );
     Ok(())
+}
+
+/// Normalized All Apps group key: trimmed, empty/blank → the default "Apps"
+/// heading. Mirrors validate_link's normalization so editor writes and lock
+/// targets always agree.
+fn group_key(group: &Option<String>) -> String {
+    group.as_deref().map(str::trim).filter(|s| !s.is_empty()).unwrap_or("Apps").to_string()
+}
+
+fn group_lock_target(owner: &str, group: &Option<String>) -> String {
+    format!("group:{owner}:apps:{}", group_key(group))
+}
+
+/// A group rename (or moving the last link out of a group) can orphan that
+/// group's lock: the lock stays keyed to the old title and the new title is
+/// suddenly wide open — a fail-open hole in a "100% locked" feature. When the
+/// old group is left EMPTY, move the lock to the new title (fail closed). If
+/// the new title is locked too, the passwords can't merge, so the abandoned
+/// row is deleted instead of dangling.
+///
+/// Note: moving the lock changes the target string, and grant tokens bind the
+/// target — so browsers unlocked under the old name re-enter the (same)
+/// password once. The lock itself, and its password, survive.
+fn migrate_group_lock(db: &Connection, owner: &str, old_group: &Option<String>, new_group: &Option<String>) {
+    let old_key = group_key(old_group);
+    let new_key = group_key(new_group);
+    if old_key == new_key { return; }
+    let old_target = group_lock_target(owner, &Some(old_key.clone()));
+    if lock_hash_of(db, owner, &old_target).is_none() { return; }
+    // Counted AFTER the update: the edited link is already in the new group.
+    let remaining: i64 = db.query_row(
+        "SELECT COUNT(*) FROM links WHERE owner_id = ?1 AND section = 'apps' AND COALESCE(NULLIF(TRIM(group_title), ''), 'Apps') = ?2",
+        params![owner, old_key], |r| r.get(0)).unwrap_or(0);
+    if remaining > 0 { return; } // group still has members — lock stays with it
+    let new_target = group_lock_target(owner, &Some(new_key));
+    if lock_hash_of(db, owner, &new_target).is_some() {
+        let _ = db.execute("DELETE FROM locks WHERE owner_id = ?1 AND target = ?2", params![owner, old_target]);
+    } else {
+        let _ = db.execute("UPDATE locks SET target = ?1 WHERE owner_id = ?2 AND target = ?3",
+            params![new_target, owner, old_target]);
+    }
 }
 
 /// Validate a requested folder assignment: the folder must exist, belong to
@@ -3905,6 +4426,10 @@ async fn admin_links_update(State(st): State<Shared>, headers: HeaderMap, Path(i
             "UPDATE links SET kind = ?1, label = ?2, url = ?3, icon = ?4, section = ?5, col = ?6, row = ?7, sort = ?8, group_title = ?9, folder_id = ?10, icon_bg = ?11 WHERE id = ?12",
             params![kind, label, url, icon_stored, section, col, row, sort, group, fid, sanitize_icon_bg(&input2.icon_bg), id],
         );
+        // v1.18.1: a rename that empties the old group must not orphan its lock.
+        if existing.section == "apps" && section == "apps" {
+            migrate_group_lock(&db, &existing.owner_id, &existing.group_title, &group);
+        }
         if icon_mode == "auto" {
             let _ = db.execute("DELETE FROM favicons WHERE link_id = ?1", params![id]);
             if kind == "url" { url } else { None }
@@ -4594,6 +5119,25 @@ async fn serve_upload(State(st): State<Shared>, Path(file): Path<String>) -> Res
     }
 }
 
+/// Wallpapers are public assets like icons, served with the same
+/// no-script headers — an uploaded SVG can never execute here.
+async fn serve_wallpaper(State(st): State<Shared>, Path(file): Path<String>) -> Response {
+    if !is_icon_filename(&file) {
+        return err_json(StatusCode::NOT_FOUND, "not found");
+    }
+    match std::fs::read(st.data_dir.join("uploads/wallpapers").join(&file)) {
+        Ok(bytes) => Response::builder()
+            .status(StatusCode::OK)
+            .header(header::CONTENT_TYPE, icon_content_type(&file))
+            .header(header::CACHE_CONTROL, "no-cache")
+            .header("X-Content-Type-Options", "nosniff")
+            .header(header::CONTENT_SECURITY_POLICY, "script-src 'none'; sandbox")
+            .body(Body::from(bytes))
+            .unwrap(),
+        Err(_) => err_json(StatusCode::NOT_FOUND, "not found"),
+    }
+}
+
 #[derive(Deserialize)]
 struct IconUploadReq {
     filename: String,
@@ -4641,6 +5185,98 @@ async fn admin_icons_delete(State(st): State<Shared>, headers: HeaderMap, Path(f
     match std::fs::remove_file(st.data_dir.join("uploads/icons").join(&file)) {
         Ok(()) => admin_json(StatusCode::OK, serde_json::json!({ "ok": true })),
         Err(_) => admin_json(StatusCode::NOT_FOUND, serde_json::json!({ "error": "no such upload" })),
+    }
+}
+
+// ── Uploaded wallpapers (admin: the shared library) ───────────────
+// Panel uploads land in uploads/wallpapers with a plain safe name —
+// no u<id>- prefix — which is what marks them as shared library
+// (see me_wallpapers_list). Deleting one clears every user's choice
+// pointing at it, so nobody is left on a missing file.
+async fn admin_wallpapers_list(State(st): State<Shared>, headers: HeaderMap) -> Response {
+    if let Err(r) = require_admin(&st, &headers) {
+        return r;
+    }
+    let db = st.db.lock().unwrap();
+    let owners: std::collections::HashMap<String, String> = {
+        let mut stmt = match db.prepare("SELECT id, username FROM users") {
+            Ok(s) => s,
+            Err(_) => return admin_json(StatusCode::INTERNAL_SERVER_ERROR, serde_json::json!({ "error": "db error" })),
+        };
+        let m = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)));
+        match m {
+            Ok(q) => q.filter_map(|x| x.ok()).collect(),
+            Err(_) => std::collections::HashMap::new(),
+        }
+    };
+    drop(db);
+    let mut items: Vec<serde_json::Value> = Vec::new();
+    if let Ok(rd) = std::fs::read_dir(st.data_dir.join("uploads/wallpapers")) {
+        for ent in rd.flatten() {
+            let name = ent.file_name().to_string_lossy().to_string();
+            if !is_icon_filename(&name) {
+                continue;
+            }
+            let owner = owners
+                .iter()
+                .find(|(uid, _)| name.starts_with(&format!("u{}-", uid)))
+                .map(|(_, uname)| uname.clone());
+            items.push(serde_json::json!({
+                "path": format!("/wallpapers/{}", name), "name": name,
+                "library": owner.is_none(), "owner": owner,
+            }));
+        }
+    }
+    items.sort_by(|a, b| a["name"].as_str().unwrap_or("").cmp(b["name"].as_str().unwrap_or("")));
+    admin_json(StatusCode::OK, serde_json::json!({ "wallpapers": items }))
+}
+
+async fn admin_wallpapers_upload(State(st): State<Shared>, headers: HeaderMap, Json(input): Json<IconUploadReq>) -> Response {
+    let sess = match require_admin(&st, &headers) { Ok(s) => s, Err(r) => return r };
+    if let Err(r) = require_csrf(&sess, &headers) { return r; }
+    let name = match sanitize_icon_name(&input.filename) {
+        Some(n) => n,
+        None => return admin_json(StatusCode::BAD_REQUEST, serde_json::json!({ "error": "filename must end in .png, .svg, .ico, .jpg, .jpeg, .webp or .gif" })),
+    };
+    let cleaned_b64: String = input.data_base64.chars().filter(|c| !c.is_whitespace()).collect();
+    let payload = cleaned_b64.rsplit(',').next().unwrap_or("");
+    use base64::Engine;
+    let bytes = match base64::engine::general_purpose::STANDARD.decode(payload) {
+        Ok(b) => b,
+        Err(_) => return admin_json(StatusCode::BAD_REQUEST, serde_json::json!({ "error": "could not decode the file data" })),
+    };
+    if bytes.is_empty() || bytes.len() > 8 * 1024 * 1024 {
+        return admin_json(StatusCode::BAD_REQUEST, serde_json::json!({ "error": "wallpaper must be between 1 byte and 8 MB" }));
+    }
+    let ext = name.rsplit('.').next().unwrap_or("").to_lowercase();
+    if !icon_content_matches(&ext, &bytes) {
+        return admin_json(StatusCode::BAD_REQUEST, serde_json::json!({ "error": "the file's content does not match its extension" }));
+    }
+    let dir = st.data_dir.join("uploads/wallpapers");
+    if std::fs::create_dir_all(&dir).is_err() {
+        return admin_json(StatusCode::INTERNAL_SERVER_ERROR, serde_json::json!({ "error": "could not create the uploads dir" }));
+    }
+    match std::fs::write(dir.join(&name), &bytes) {
+        Ok(()) => admin_json(StatusCode::OK, serde_json::json!({ "ok": true, "path": format!("/wallpapers/{}", name) })),
+        Err(e) => admin_json(StatusCode::INTERNAL_SERVER_ERROR, serde_json::json!({ "error": format!("write failed: {e}") })),
+    }
+}
+
+async fn admin_wallpapers_delete(State(st): State<Shared>, headers: HeaderMap, Path(file): Path<String>) -> Response {
+    let sess = match require_admin(&st, &headers) { Ok(s) => s, Err(r) => return r };
+    if let Err(r) = require_csrf(&sess, &headers) { return r; }
+    if !is_icon_filename(&file) {
+        return admin_json(StatusCode::BAD_REQUEST, serde_json::json!({ "error": "bad filename" }));
+    }
+    match std::fs::remove_file(st.data_dir.join("uploads/wallpapers").join(&file)) {
+        Ok(()) => {
+            let db = st.db.lock().unwrap();
+            let path = format!("/wallpapers/{}", file);
+            let _ = db.execute("UPDATE users SET wallpaper_path = NULL WHERE wallpaper_path = ?1", params![path]);
+            scrub_rotation_path(&db, &path);
+            admin_json(StatusCode::OK, serde_json::json!({ "ok": true }))
+        }
+        Err(_) => admin_json(StatusCode::NOT_FOUND, serde_json::json!({ "error": "no such wallpaper" })),
     }
 }
 
@@ -4834,6 +5470,39 @@ fn init_db(data_dir: &FsPath) -> Connection {
             }
         }
     }
+    // Wallpapers (v1.19.0): the signed-in user's chosen desktop
+    // background (a "/wallpapers/<file>" path, or NULL = default).
+    {
+        let mut stmt = db.prepare("PRAGMA table_info(users)").expect("pragma table_info users");
+        let cols: Vec<String> = stmt
+            .query_map([], |r| r.get::<_, String>(1))
+            .expect("pragma rows")
+            .filter_map(|c| c.ok())
+            .collect();
+        if !cols.iter().any(|c| c == "wallpaper_path") {
+            db.execute("ALTER TABLE users ADD COLUMN wallpaper_path TEXT", [])
+                .expect("add users wallpaper_path");
+        }
+        // Rotation (v1.20.0): {mode, seconds, paths[]} JSON, or NULL = off.
+        if !cols.iter().any(|c| c == "rotation_json") {
+            db.execute("ALTER TABLE users ADD COLUMN rotation_json TEXT", [])
+                .expect("add users rotation_json");
+        }
+    }
+    // Wallpaper reports (v1.19.0): the reported wallpaper's path, so
+    // the admin can remove it one-click. NULL for link/profile reports.
+    {
+        let mut stmt = db.prepare("PRAGMA table_info(reports)").expect("pragma table_info reports");
+        let cols: Vec<String> = stmt
+            .query_map([], |r| r.get::<_, String>(1))
+            .expect("pragma rows")
+            .filter_map(|c| c.ok())
+            .collect();
+        if !cols.iter().any(|c| c == "target") {
+            db.execute("ALTER TABLE reports ADD COLUMN target TEXT", [])
+                .expect("add reports target");
+        }
+    }
     db
 }
 
@@ -4962,6 +5631,7 @@ async fn main() {
         .route("/api/admin/reports/:id/status", post(admin_report_status))
         .route("/api/admin/reports/:id/delete", post(admin_report_delete))
         .route("/api/admin/reports/:id/remove-icon", post(admin_report_remove_icon))
+        .route("/api/admin/reports/:id/remove-wallpaper", post(admin_report_remove_wallpaper))
         .route("/s/:token", get(share_landing))
         .route("/s/:token/go/:link_id", get(share_open))
         .route("/api/admin/shares", get(admin_shares_list).post(admin_share_create))
@@ -4977,7 +5647,11 @@ async fn main() {
         .route("/api/admin/icons", get(admin_icons))
         .route("/api/admin/icons/upload", post(admin_icons_upload))
         .route("/api/admin/icons/:file", delete(admin_icons_delete))
+        .route("/api/admin/wallpapers", get(admin_wallpapers_list))
+        .route("/api/admin/wallpapers/upload", post(admin_wallpapers_upload))
+        .route("/api/admin/wallpapers/:file", delete(admin_wallpapers_delete))
         .route("/uploads/:file", get(serve_upload))
+        .route("/wallpapers/:file", get(serve_wallpaper))
         // Account API (any session + CSRF on mutations)
         .route("/api/me/session", get(me_session))
         .route("/api/me/tokens", get(me_tokens).post(me_tokens_create))
@@ -4989,6 +5663,11 @@ async fn main() {
         .route("/api/me/links/:id/update", post(me_links_update))
         .route("/api/me/links/:id/delete", post(me_links_delete))
         .route("/api/me/icons", get(me_icons_list).post(me_icons_upload))
+        .route("/api/me/wallpapers", get(me_wallpapers_list))
+        .route("/api/me/wallpapers/upload", post(me_wallpapers_upload))
+        .route("/api/me/wallpapers/choose", post(me_wallpapers_choose))
+        .route("/api/me/wallpapers/delete", post(me_wallpapers_delete))
+        .route("/api/me/wallpapers/rotation", post(me_wallpapers_rotation))
         .route("/api/me/shares", get(me_shares_list).post(me_share_create))
         .route("/api/me/shares/:id/revoke", post(me_share_revoke))
         // Obscure admin path (single segment, value lives in settings)
@@ -4996,6 +5675,12 @@ async fn main() {
         .route("/:seg/login", post(admin_login))
         .route("/:seg/logout", post(logout))
         .fallback(fallback)
+        // Axum's default JSON body cap is 2 MB, but wallpaper uploads
+        // are base64 JSON: an 8 MB file encodes to ~10.7 MB, so the
+        // cap must clear the largest legal upload or every big
+        // wallpaper dies with a bare HTTP 413 before the handler
+        // runs. The handlers still enforce the 8 MB file limit.
+        .layer(DefaultBodyLimit::max(16 * 1024 * 1024))
         .with_state(state);
 
     let addr = SocketAddr::from(([0, 0, 0, 0], port));

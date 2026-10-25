@@ -988,10 +988,21 @@ pub fn panel_page() -> String {
 
 <div class="card glass">
   <h2>Reports <span class="badge" id="repCount" style="display:none"></span></h2>
-  <p class="sub">Links, apps and folders your users flagged (right-click a tile, or the ⚑ button in a folder). Resolved and dismissed reports stay here for the record.</p>
+  <p class="sub">Links, apps, folders and wallpapers your users flagged (right-click a tile, or the ⚑ button in a folder or the Wallpaper picker). Resolved and dismissed reports stay here for the record.</p>
   <div class="err" id="repErr"></div>
   <p class="sub" id="repMailHint" style="display:none;color:#ffb02e"></p>
   <table><thead><tr><th>When</th><th>Link</th><th>Belongs to</th><th>Reported by</th><th>Reason</th><th>Status</th><th></th></tr></thead><tbody id="repBody"></tbody></table>
+</div>
+
+<div class="card glass">
+  <h2>Wallpapers</h2>
+  <p class="sub">The shared wallpaper library: uploads here are offered to every user in the desktop Wallpaper picker, alongside their own uploads. Deleting one clears it from anyone using it (they fall back to the default).</p>
+  <div class="err" id="wpErr"></div><div class="ok" id="wpOk"></div>
+  <table><thead><tr><th>Preview</th><th>File</th><th>Owner</th><th></th></tr></thead><tbody id="wpBody"></tbody></table>
+  <form id="wpForm" class="row" style="align-items:flex-end">
+    <div><label>Upload a shared wallpaper<input type="file" id="wpFile" accept="image/*"></label></div>
+    <div style="flex:0"><button class="primary" type="submit">Upload</button></div>
+  </form>
 </div>
 
 <div class="card glass">
@@ -1474,14 +1485,24 @@ async function loadReports() {
       const src = r.icon === 'auto' ? '/icon/' + r.link_id : (r.icon.startsWith('src/') ? '/' + r.icon : r.icon);
       ic = '<img src="' + esc(src) + '" alt="" style="width:22px;height:22px;border-radius:6px;vertical-align:-6px;margin-right:7px" onerror="this.remove()"> ';
     }
+    if (r.target) {
+      ic = '<img src="' + esc(r.target) + '" alt="" style="width:64px;height:36px;object-fit:cover;border-radius:6px;vertical-align:-6px;margin-right:7px" onerror="this.remove()"> ';
+    }
+    let via = '';
+    if (r.source && r.source !== 'startpage') {
+      if (r.source.startsWith('share:')) via = '<div class="sub">via ' + esc(r.source.slice(6)) + ' (share link)</div>';
+      else if (r.source.startsWith('profile:')) via = '<div class="sub">via ' + esc(r.source.slice(8)) + ' (profile)</div>';
+      else if (r.source === 'wallpaper') via = '<div class="sub">via wallpaper</div>';
+    }
     return '<tr><td>' + fmt(r.created_at) + '</td><td>' + ic + '<b>' + esc(r.label) + '</b>' + (r.icon_upload ? ' <span class="sub">(uploaded icon)</span>' : '') +
       (r.url ? '<div class="sub" style="max-width:340px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="' + esc(r.url) + '">' + esc(r.url) + '</div>' : '') +
-      (r.source && r.source !== 'startpage' ? '<div class="sub">via ' + esc(r.source.replace('share:', '').replace('profile:', '')) + (r.source.startsWith('share:') ? ' (share link)' : ' (profile)') + '</div>' : '') + '</td><td>' + esc(r.owner) + '</td>' +
+      via + '</td><td>' + esc(r.owner) + '</td>' +
     '<td>' + esc(r.reporter) + '</td><td>' + esc(r.reason || '—') + '</td><td>' + esc(r.status) + '</td>' +
     '<td style="white-space:nowrap">' + (r.status === 'open'
       ? '<button class="small" data-rep="resolved" data-id="' + r.id + '">Resolve</button> <button class="small" data-rep="dismissed" data-id="' + r.id + '">Dismiss</button>'
       : '<button class="small" data-rep="open" data-id="' + r.id + '">Reopen</button>') +
       (r.icon_upload ? ' <button class="small" data-repicon="' + r.id + '">Remove icon</button>' : '') +
+      (r.target ? ' <button class="small" data-repwall="' + r.id + '">Remove wallpaper</button>' : '') +
       ' <button class="small danger" data-repdel="' + r.id + '">Delete</button></td></tr>';
   }).join('') ||
     '<tr><td colspan="7" class="sub">No reports yet.</td></tr>';
@@ -1501,9 +1522,54 @@ $('repBody').addEventListener('click', async e => {
     catch (err) { show('repErr', err.message); }
     return;
   }
+  const rwp = e.target.closest('[data-repwall]');
+  if (rwp) {
+    if (!confirm('Delete this wallpaper and clear it from anyone using it? The report is marked resolved.')) return;
+    try { await api('POST', '/api/admin/reports/' + rwp.dataset.repwall + '/remove-wallpaper', {}); show('repOk', 'Wallpaper removed.'); loadReports(); }
+    catch (err) { show('repErr', err.message); }
+    return;
+  }
   const b = e.target.closest('[data-rep]'); if (!b) return;
   try { await api('POST', '/api/admin/reports/' + b.dataset.id + '/status', { status: b.dataset.rep }); loadReports(); }
   catch (err) { show('repErr', err.message); }
+});
+
+// ── Wallpapers (shared library) ──────────────────────────────────
+async function loadWallpapers() {
+  const d = await api('GET', '/api/admin/wallpapers');
+  $('wpBody').innerHTML = d.wallpapers.map(w => {
+    const thumb = '<img src="' + esc(w.path) + '" alt="" style="width:64px;height:40px;object-fit:cover;border-radius:6px;vertical-align:middle" onerror="this.remove()"> ';
+    return '<tr><td>' + thumb + '</td><td><b>' + esc(w.name) + '</b></td><td>' + (w.library ? 'shared library' : esc(w.owner || 'user upload')) + '</td>' +
+      '<td style="white-space:nowrap"><button class="small danger" data-wpdel="' + esc(w.path.split('/').pop()) + '">Delete</button></td></tr>';
+  }).join('') ||
+    '<tr><td colspan="4" class="sub">No wallpapers yet — upload one below, or users can upload their own from the desktop.</td></tr>';
+}
+$('wpBody').addEventListener('click', async e => {
+  const del = e.target.closest('[data-wpdel]');
+  if (!del) return;
+  if (!confirm('Delete this wallpaper? Anyone using it falls back to the default.')) return;
+  try { await api('DELETE', '/api/admin/wallpapers/' + encodeURIComponent(del.dataset.wpdel)); show('wpOk', 'Wallpaper deleted.'); loadWallpapers(); }
+  catch (err) { show('wpErr', err.message); }
+});
+$('wpForm').addEventListener('submit', async e => {
+  e.preventDefault();
+  const files = Array.from($('wpFile').files || []);
+  if (!files.length) { show('wpErr', 'Choose an image file first.'); return; }
+  let done = 0; const failed = [];
+  for (const f of files) {
+    if (f.size > 8 * 1024 * 1024) { failed.push(f.name + ' (over 8 MB)'); continue; }
+    try {
+      const buf = await f.arrayBuffer();
+      const bytes = new Uint8Array(buf);
+      let bin = '';
+      for (let i = 0; i < bytes.length; i += 0x8000) bin += String.fromCharCode.apply(null, bytes.subarray(i, i + 0x8000));
+      await api('POST', '/api/admin/wallpapers/upload', { filename: f.name, data_base64: btoa(bin) });
+      done++;
+    } catch (err) { failed.push(f.name + ' (' + err.message + ')'); }
+  }
+  if (done) show('wpOk', 'Uploaded ' + done + ' wallpaper' + (done === 1 ? '' : 's') + ' to the shared library.' + (failed.length ? ' Failed: ' + failed.join(', ') : ''));
+  else show('wpErr', 'Upload failed: ' + failed.join(', '));
+  e.target.reset(); loadWallpapers();
 });
 
 // ── Share links ────────────────────────────────────────────────
@@ -1575,7 +1641,7 @@ $('logout').addEventListener('click', async () => { await fetch(location.pathnam
   ICONS = (await api('GET', '/api/admin/icons')).icons;
   $('fIcon').innerHTML = ICONS.map(i => '<option value="' + esc(i) + '">' + esc(i) + '</option>').join('');
   $('bIcon').innerHTML = ICONS.map(i => '<option value="' + esc(i) + '">' + esc(i) + '</option>').join('');
-  await loadUsers(); await loadLinks(); await loadTokens(); await loadBranding(); await loadSite(); await loadReports(); kindSync();
+  await loadUsers(); await loadLinks(); await loadTokens(); await loadBranding(); await loadSite(); await loadReports(); await loadWallpapers(); kindSync();
 })().catch(err => show('linkErr', err.message));
 
 // ── Icon uploads ────────────────────────────────────────────────────

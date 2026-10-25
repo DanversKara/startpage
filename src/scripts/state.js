@@ -11,7 +11,7 @@
 
 const GRID = { ox: 24, oy: 55, uw: 120, uh: 124 };
 
-let S = { desktopIcons: [], dock: [], bookmarkSections: [{ blocks: [] }], about: [], branding: null };
+let S = { desktopIcons: [], dock: [], bookmarkSections: [{ blocks: [] }], about: [], branding: null, wallpaper: null, rotation: null };
 let millerSel = 0;
 
 // ─────────────────────────────────────────────────────────────────────
@@ -85,10 +85,22 @@ async function loadState() {
 				links: (g.links || []).map(linkItem),
 			})),
 			branding: data.branding || null,
+			wallpaper: data.wallpaper || null,
+			rotation: data.rotation || null,
 			csrf,
 		};
 	} catch (_) {
-		S = { desktopIcons: [], dock: [], bookmarkSections: [{ blocks: [] }], about: [], branding: null, csrf };
+		S = { desktopIcons: [], dock: [], bookmarkSections: [{ blocks: [] }], about: [], branding: null, wallpaper: null, rotation: null, csrf };
 	}
 	ensureIconPositions();
+}
+
+// ── Wallpaper ──────────────────────────────────────────────────
+// The desktop background comes from the server (state.wallpaper):
+// the signed-in user's choice, else the public owner's, else the
+// bundled default. It rides a CSS variable so choosing a new one
+// repaints instantly without a reload.
+function applyWallpaper(path) {
+	if (path) document.documentElement.style.setProperty('--wallpaper-url', 'url("' + path + '")');
+	else document.documentElement.style.removeProperty('--wallpaper-url');
 }

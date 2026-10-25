@@ -88,7 +88,7 @@ body::before {
     content: '';
     position: fixed;
     inset: 0;
-    background-image: url('../background.jpeg');
+    background-image: var(--wallpaper-url, url('../background.jpeg'));
     background-size: cover;
     background-position: top center;
     z-index: -2;
@@ -1252,6 +1252,35 @@ body::after {
 .report-btn { background: rgba(255,255,255,.1); border: 1px solid rgba(255,255,255,.16); color: #fff; border-radius: 9px; padding: 8px 14px; font: 13px system-ui, sans-serif; cursor: pointer; }
 .report-btn.primary { background: #2f6bff; border-color: #2f6bff; font-weight: 600; }
 .report-btn:disabled { opacity: .55; cursor: default; }
+
+/* Wallpaper picker (v1.19.0): menu-bar panel + tile grid. */
+.wp-pop { position: fixed; inset: 0; z-index: 410; background: rgba(0,0,0,.45); display: flex; align-items: center; justify-content: center; }
+.wp-pop[hidden] { display: none; }
+.wp-pop.top { z-index: 420; }
+.wp-card { width: min(640px, calc(100vw - 40px)); max-height: calc(100vh - 80px); overflow-y: auto; background: rgba(24,24,32,.97); border: 1px solid rgba(255,255,255,.14); border-radius: 16px; padding: 20px 22px; color: #f2f2f5; font-family: system-ui, sans-serif; box-shadow: 0 18px 50px rgba(0,0,0,.5); }
+.wp-card h3 { margin: 0 0 6px; font-size: 16px; }
+.wp-card p { margin: 0 0 10px; font-size: 13px; line-height: 1.45; color: rgba(255,255,255,.72); }
+.wp-head { display: flex; align-items: center; justify-content: space-between; }
+.wp-close { background: none; border: none; color: rgba(255,255,255,.7); font-size: 20px; cursor: pointer; padding: 0 2px; }
+.wp-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 12px; margin: 12px 0; }
+.wp-tile { background: rgba(255,255,255,.05); border: 1px solid rgba(255,255,255,.12); border-radius: 12px; padding: 8px; }
+.wp-tile.current { border-color: #2f6bff; box-shadow: 0 0 0 1px #2f6bff inset; }
+.wp-thumb { display: block; width: 100%; padding: 0; border: none; background: none; cursor: pointer; }
+.wp-thumb img { display: block; width: 100%; height: 84px; object-fit: cover; border-radius: 8px; }
+.wp-name { margin-top: 7px; font-size: 12px; color: rgba(255,255,255,.85); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.wp-current { color: #7fb0ff; font-weight: 600; }
+.wp-tile-actions { display: flex; gap: 6px; margin-top: 7px; }
+.wp-mini { background: rgba(255,255,255,.1); border: 1px solid rgba(255,255,255,.16); color: #fff; border-radius: 8px; padding: 5px 10px; font: 12px system-ui, sans-serif; cursor: pointer; }
+.wp-mini.danger { color: #ffb4b4; }
+.wp-upload { display: flex; gap: 10px; align-items: center; margin-top: 4px; }
+.wp-msg { min-height: 18px; }
+.wp-rot { background: rgba(255,255,255,.05); border: 1px solid rgba(255,255,255,.12); border-radius: 12px; padding: 10px 12px; margin: 0 0 12px; }
+.wp-rot-row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; font-size: 13px; }
+.wp-rot select, .wp-rot input { background: rgba(255,255,255,.08); border: 1px solid rgba(255,255,255,.16); color: #fff; border-radius: 8px; padding: 6px 8px; font: 13px system-ui, sans-serif; }
+.wp-rot option { background-color: #1c1d26; color: #f2f2f5; }
+.wp-rot input { width: 70px; }
+.wp-rot-note { font-size: 12px; color: rgba(255,255,255,.6); margin-top: 6px; }
+.wp-mini.on { background: #2f6bff; border-color: #2f6bff; font-weight: 600; }
 .report-msg { min-height: 18px; margin: 10px 0 0 !important; }
 .folder-member { position: relative; }
 
