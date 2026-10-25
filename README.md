@@ -3,6 +3,12 @@
 A desktop-for-your-links startpage with a real backend. This is a secured,
 multi-user edition of **Bookmark OS** by Marc Cheng (see *Attribution*).
 
+## See it in action
+
+[![startpage os — demo video](https://img.youtube.com/vi/dwrC1iu96_o/hqdefault.jpg)](https://youtu.be/dwrC1iu96_o)
+
+Watch how it works: [startpage os on YouTube](https://youtu.be/dwrC1iu96_o)
+
 ## What changed vs. upstream
 
 Upstream Bookmark OS is a **static web page with no backend at all** — despite
@@ -61,6 +67,12 @@ This edition adds a small **Rust** service (`server/`, binary
   admins cannot set or read anyone else's PIN. The PIN is deliberately
   kept out of the folder-lock table, because /api/unlock has no IP
   lockout and a 4-digit PIN must never be brute-forceable through it.
+- **Demo video (v1.22.0):** a "See how it works" banner at the top of
+  the page embeds the [startpage os demo](https://youtu.be/dwrC1iu96_o)
+  via YouTube's privacy-enhanced embed (no cookies until you press
+  play). Dismiss it with the ✕ and it stays dismissed in that browser;
+  the menu-bar "Demo video" button brings it back any time. The video
+  is also linked at the top of this README under "See it in action".
 
 ## Security model — and its honest limits
 
