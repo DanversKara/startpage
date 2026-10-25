@@ -154,9 +154,45 @@ async function setupAccountLine() {
 // Init — state comes from the server; first paint is the desktop itself
 // (there is no welcome card in this edition).
 // ─────────────────────────────────────────────────────────────────────
+// ── Startpage PIN gate (v1.21.0) ─────────────────────────────
+// When the server says this owner's page is PIN-protected, it sent no
+// links at all — so the desktop stays empty behind a full-screen gate.
+// A correct PIN earns the grant cookie and a reload brings the page.
+// The gate is a lock screen, not a modal: Escape never dismisses it.
+function setupPinGate() {
+	const gate = $('pinGate');
+	const input = $('pinGateInput');
+	const err = $('pinGateErr');
+	if (S.pinLen) input.maxLength = S.pinLen;
+	$('pinGateForm').addEventListener('submit', async e => {
+		e.preventDefault();
+		err.textContent = '';
+		try {
+			const r = await fetch('/api/page-pin/unlock', {
+				method: 'POST',
+				headers: { 'Content-Type': 'application/json' },
+				body: JSON.stringify({ pin: input.value }),
+			});
+			if (!r.ok) {
+				let detail = 'unlock ' + r.status;
+				try { const d = await r.json(); if (d.error) detail = d.error; } catch (_) {}
+				throw new Error(detail);
+			}
+			location.reload();
+		} catch (e2) {
+			err.textContent = e2.message;
+			input.value = '';
+			input.focus();
+		}
+	});
+	gate.hidden = false;
+	input.focus();
+}
+
 (async function init() {
 	await loadState();
 	applyWallpaper(S.wallpaper);
+	if (S.pinRequired) { setupPinGate(); return; }
 	applyRotationAtBoot();
 	renderDesktopIcons();
 	renderDock();

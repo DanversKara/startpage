@@ -73,6 +73,18 @@
 
 		<div class="dock" id="dock"></div>
 
+		<div class="pin-gate" id="pinGate" hidden>
+			<div class="pin-gate-card">
+				<h2>This startpage is protected</h2>
+				<p>Enter the owner's PIN to view it.</p>
+				<form id="pinGateForm">
+					<input id="pinGateInput" type="password" inputmode="numeric" autocomplete="off" placeholder="PIN">
+					<button type="submit">Unlock</button>
+				</form>
+				<p class="pin-gate-err" id="pinGateErr"></p>
+			</div>
+		</div>
+
 		<div class="about-panel" id="aboutPanel">
 			<div class="card">
 				<div class="about-bar" id="aboutBar">

@@ -673,6 +673,34 @@ fn viewer_owner(st: &Shared, headers: &HeaderMap) -> Option<String> {
 // ─────────────────────────────────────────────────────────────────────
 async fn api_state(State(st): State<Shared>, headers: HeaderMap) -> Response {
     let owner = viewer_owner(&st, &headers);
+    // Page PIN (v1.21.0): a visitor facing a PIN-protected owner's page
+    // gets NO owner content at all — no links, no wallpaper, no
+    // rotation — just the gate flag and the PIN length (the length is
+    // UX, not a secret). Site-wide branding still ships so the gate
+    // looks like part of the site. The owner's own signed-in view is
+    // never gated.
+    let gated = match owner.as_deref() {
+        Some(oid) => {
+            // Session lookup takes the db lock itself — resolve it
+            // BEFORE locking the db here, or this deadlocks.
+            let is_owner = session_from_headers(&st, &headers).map(|s| s.user.id == oid).unwrap_or(false);
+            let db = st.db.lock().unwrap();
+            page_pin_of(&db, oid).is_some() && !is_owner && !has_pagepin_grant(&db, &headers, oid)
+        }
+        None => false,
+    };
+    if gated {
+        let (branding, pin_len) = {
+            let db = st.db.lock().unwrap();
+            let len = owner.as_deref().and_then(|oid| page_pin_of(&db, oid)).map(|(_, l)| l).unwrap_or(4);
+            (get_branding(&db), len)
+        };
+        return json_response(StatusCode::OK, serde_json::json!({
+            "desktop": [], "dock": [], "apps": [], "about": [], "branding": branding,
+            "wallpaper": null, "rotation": { "mode": "off", "seconds": 60, "paths": [] },
+            "pin_required": true, "pin_len": pin_len
+        }));
+    }
     // The desktop background for whoever is viewing: the signed-in
     // user's choice, else the public owner's choice, else default.
     let wallpaper: Option<String> = owner.as_deref().and_then(|oid| {
@@ -788,7 +816,7 @@ async fn api_state(State(st): State<Shared>, headers: HeaderMap) -> Response {
         .collect();
     json_response(StatusCode::OK, serde_json::json!({
         "desktop": desktop, "dock": dock, "apps": apps_json, "about": group(about), "branding": branding,
-        "wallpaper": wallpaper, "rotation": rotation
+        "wallpaper": wallpaper, "rotation": rotation, "pin_required": false
     }))
 }
 
@@ -3133,6 +3161,182 @@ async fn me_wallpapers_rotation(State(st): State<Shared>, headers: HeaderMap, Js
     let stored = serde_json::json!({ "mode": mode, "seconds": seconds, "paths": clean });
     let _ = db.execute("UPDATE users SET rotation_json = ?1 WHERE id = ?2", params![stored.to_string(), sess.user.id]);
     admin_json(StatusCode::OK, serde_json::json!({ "ok": true, "rotation": stored }))
+}
+
+// ── Startpage PIN (v1.21.0) ──────────────────────────────────
+// A user can PIN-protect their startpage: signed-out visitors then
+// get no links at all from /api/state until they enter the PIN and
+// earn a grant cookie. The PIN is deliberately NOT stored as a
+// folder-lock row: /api/unlock has no IP lockout, and a 4-digit PIN
+// must never be brute-forceable through it — so the page PIN lives
+// in its own users columns with its own rate-limited unlock endpoint
+// and its own grant cookie. Changing or removing the PIN rotates the
+// hash, which kills outstanding grants, same as folder locks.
+
+const PAGEPIN_COOKIE: &str = "sp_pagepin";
+
+fn page_pin_of(db: &Connection, user_id: &str) -> Option<(String, i64)> {
+    let row: Option<(Option<String>, Option<i64>)> = db
+        .query_row("SELECT page_pin_hash, page_pin_len FROM users WHERE id = ?1", params![user_id], |r| {
+            Ok((r.get(0)?, r.get(1)?))
+        })
+        .ok();
+    match row {
+        Some((Some(hash), Some(len))) => Some((hash, len)),
+        _ => None,
+    }
+}
+
+fn pagepin_token(db: &Connection, owner: &str, pin_hash: &str) -> String {
+    let secret = get_setting(db, "unlock_secret").unwrap_or_default();
+    sha256_hex(&format!("{secret}|pagepin:{owner}|{pin_hash}"))
+}
+
+fn has_pagepin_grant(db: &Connection, headers: &HeaderMap, owner: &str) -> bool {
+    let (hash, _) = match page_pin_of(db, owner) {
+        Some(p) => p,
+        None => return false,
+    };
+    match cookie_get(headers, PAGEPIN_COOKIE) {
+        Some(tok) => tok == pagepin_token(db, owner, &hash),
+        None => false,
+    }
+}
+
+/// PIN unlock rate limiting: the same IP bucket and limits as logins,
+/// but with PIN-specific messages (a wrong PIN must not report a login
+/// error). Sharing the bucket means hammering either credential locks
+/// the IP out of both — acceptable on a self-hosted page.
+fn pin_gate(st: &Shared, ip: &str) -> Result<(), Response> {
+    let attempts = st.attempts.lock().unwrap();
+    if let Some(f) = attempts.get(ip) {
+        if let Some(until) = f.locked_until {
+            if until > Instant::now() {
+                return Err(err_json(StatusCode::TOO_MANY_REQUESTS, "too many wrong PINs — try again in 15 minutes"));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn pin_failed(st: &Shared, ip: &str) -> Response {
+    let mut attempts = st.attempts.lock().unwrap();
+    let f = attempts.entry(ip.to_string()).or_insert(FailInfo { count: 0, locked_until: None });
+    f.count += 1;
+    if f.count >= MAX_LOGIN_FAILURES {
+        f.locked_until = Some(Instant::now() + LOCKOUT);
+        f.count = 0;
+        return err_json(StatusCode::TOO_MANY_REQUESTS, "too many wrong PINs — locked for 15 minutes");
+    }
+    err_json(StatusCode::FORBIDDEN, "wrong PIN")
+}
+
+fn pin_succeeded(st: &Shared, ip: &str) {
+    st.attempts.lock().unwrap().remove(ip);
+}
+
+async fn me_page_pin_get(State(st): State<Shared>, headers: HeaderMap) -> Response {
+    let sess = match require_session(&st, &headers) {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
+    let db = st.db.lock().unwrap();
+    match page_pin_of(&db, &sess.user.id) {
+        Some((_, len)) => admin_json(StatusCode::OK, serde_json::json!({ "protected": true, "length": len })),
+        None => admin_json(StatusCode::OK, serde_json::json!({ "protected": false, "length": null })),
+    }
+}
+
+#[derive(Deserialize)]
+struct PagePinReq {
+    pin: String,
+    length: i64,
+}
+
+async fn me_page_pin_set(State(st): State<Shared>, headers: HeaderMap, Json(input): Json<PagePinReq>) -> Response {
+    let sess = match require_session(&st, &headers) {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
+    if let Err(r) = require_csrf(&sess, &headers) {
+        return r;
+    }
+    if ![4, 6, 12].contains(&input.length) {
+        return admin_json(StatusCode::BAD_REQUEST, serde_json::json!({ "error": "PIN length must be 4, 6 or 12 digits" }));
+    }
+    if input.pin.len() as i64 != input.length || !input.pin.bytes().all(|b| b.is_ascii_digit()) {
+        return admin_json(StatusCode::BAD_REQUEST, serde_json::json!({ "error": "PIN must be exactly 4, 6 or 12 digits" }));
+    }
+    let hash = match hash_password(&input.pin) {
+        Ok(h) => h,
+        Err(_) => return admin_json(StatusCode::INTERNAL_SERVER_ERROR, serde_json::json!({ "error": "hashing failed" })),
+    };
+    let db = st.db.lock().unwrap();
+    let _ = db.execute("UPDATE users SET page_pin_hash = ?1, page_pin_len = ?2 WHERE id = ?3", params![hash, input.length, sess.user.id]);
+    admin_json(StatusCode::OK, serde_json::json!({ "ok": true, "protected": true, "length": input.length }))
+}
+
+async fn me_page_pin_remove(State(st): State<Shared>, headers: HeaderMap) -> Response {
+    let sess = match require_session(&st, &headers) {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
+    if let Err(r) = require_csrf(&sess, &headers) {
+        return r;
+    }
+    let db = st.db.lock().unwrap();
+    let _ = db.execute("UPDATE users SET page_pin_hash = NULL, page_pin_len = NULL WHERE id = ?1", params![sess.user.id]);
+    admin_json(StatusCode::OK, serde_json::json!({ "ok": true, "protected": false }))
+}
+
+#[derive(Deserialize)]
+struct PagePinUnlockReq {
+    pin: String,
+}
+
+async fn page_pin_unlock(State(st): State<Shared>, headers: HeaderMap, conn: ConnectInfo<SocketAddr>, Json(input): Json<PagePinUnlockReq>) -> Response {
+    // Signed-in viewers never need a grant — they always see their own
+    // page — so the gate UI never sends them here. Answer ok without
+    // touching the rate limiter, so a stray call can't burn attempts.
+    if session_from_headers(&st, &headers).is_some() {
+        return json_response(StatusCode::OK, serde_json::json!({ "ok": true }));
+    }
+    let ip = client_ip(&headers, &conn.0);
+    if let Err(r) = pin_gate(&st, &ip) {
+        return r;
+    }
+    // The owner is whoever's public page this is — never a client
+    // supplied id, so a caller can't probe other users' PINs.
+    let owner = viewer_owner(&st, &headers);
+    let ok = match owner.as_deref() {
+        Some(oid) => {
+            let db = st.db.lock().unwrap();
+            match page_pin_of(&db, oid) {
+                Some((hash, _)) => verify_password(&input.pin, &hash),
+                None => false,
+            }
+        }
+        None => false,
+    };
+    if !ok {
+        // Slow wrong answers down a little (argon2 already costs).
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        return pin_failed(&st, &ip);
+    }
+    pin_succeeded(&st, &ip);
+    let oid = owner.unwrap();
+    let token = {
+        let db = st.db.lock().unwrap();
+        let (hash, _) = page_pin_of(&db, &oid).unwrap();
+        pagepin_token(&db, &oid, &hash)
+    };
+    let mut r = json_response(StatusCode::OK, serde_json::json!({ "ok": true }));
+    r.headers_mut().insert(
+        header::SET_COOKIE,
+        header::HeaderValue::from_str(&format!("{PAGEPIN_COOKIE}={token}; Path=/; HttpOnly; SameSite=Lax; Max-Age=43200"))
+            .unwrap_or_else(|_| header::HeaderValue::from_static("")),
+    );
+    r
 }
 
 async fn me_shares_list(State(st): State<Shared>, headers: HeaderMap) -> Response {
@@ -5488,6 +5692,16 @@ fn init_db(data_dir: &FsPath) -> Connection {
             db.execute("ALTER TABLE users ADD COLUMN rotation_json TEXT", [])
                 .expect("add users rotation_json");
         }
+        // Page PIN (v1.21.0): argon2 hash of the owner's startpage PIN
+        // plus its length (4, 6 or 12), or NULL = page is public.
+        if !cols.iter().any(|c| c == "page_pin_hash") {
+            db.execute("ALTER TABLE users ADD COLUMN page_pin_hash TEXT", [])
+                .expect("add users page_pin_hash");
+        }
+        if !cols.iter().any(|c| c == "page_pin_len") {
+            db.execute("ALTER TABLE users ADD COLUMN page_pin_len INTEGER", [])
+                .expect("add users page_pin_len");
+        }
     }
     // Wallpaper reports (v1.19.0): the reported wallpaper's path, so
     // the admin can remove it one-click. NULL for link/profile reports.
@@ -5668,6 +5882,9 @@ async fn main() {
         .route("/api/me/wallpapers/choose", post(me_wallpapers_choose))
         .route("/api/me/wallpapers/delete", post(me_wallpapers_delete))
         .route("/api/me/wallpapers/rotation", post(me_wallpapers_rotation))
+        .route("/api/me/page-pin", get(me_page_pin_get).post(me_page_pin_set))
+        .route("/api/me/page-pin/remove", post(me_page_pin_remove))
+        .route("/api/page-pin/unlock", post(page_pin_unlock))
         .route("/api/me/shares", get(me_shares_list).post(me_share_create))
         .route("/api/me/shares/:id/revoke", post(me_share_revoke))
         // Obscure admin path (single segment, value lives in settings)

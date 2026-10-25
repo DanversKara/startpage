@@ -771,6 +771,19 @@ pub fn account_page() -> String {
     <div style="margin-top:14px"><button class="primary" type="submit">Change password</button></div>
   </form>
 </div>
+
+<div class="card glass">
+  <h2>Startpage PIN</h2>
+  <p class="sub">Protect your startpage from being seen by others. Signed-out visitors must enter your PIN before your page loads — your links, wallpaper and rotation are never sent until then. You never need the PIN yourself while signed in, and you can change or remove it here any time.</p>
+  <div class="err" id="ppErr"></div><div class="ok" id="ppOk"></div>
+  <p class="sub" id="ppStatus"></p>
+  <form id="ppForm" class="row" style="align-items:flex-end">
+    <div><label>PIN length</label><select id="ppLen"><option value="4">4 digits</option><option value="6">6 digits</option><option value="12">12 digits</option></select></div>
+    <div><label>New PIN (digits only)</label><input id="ppPin" type="password" inputmode="numeric" autocomplete="off" maxlength="4" required></div>
+    <div style="flex:0"><button class="primary" type="submit">Set PIN</button></div>
+  </form>
+  <div style="margin-top:12px"><button type="button" id="ppRemove">Remove PIN</button></div>
+</div>
 <script>
 let CSRF = '';
 const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
@@ -898,6 +911,36 @@ document.getElementById('pwForm').addEventListener('submit', async e => {
     show('pwOk', 'Password changed. Other sessions were signed out.'); e.target.reset();
   } catch (err) { show('pwErr', err.message); }
 });
+async function loadPagePin() {
+  try {
+    const d = await api('GET', '/api/me/page-pin');
+    document.getElementById('ppStatus').textContent = d.protected
+      ? 'Your startpage is protected with a ' + d.length + '-digit PIN.'
+      : 'Your startpage is not PIN-protected.';
+    document.getElementById('ppLen').value = d.protected ? String(d.length) : '4';
+    document.getElementById('ppPin').maxLength = d.protected ? d.length : 4;
+  } catch (err) { show('ppErr', err.message); }
+}
+document.getElementById('ppLen').addEventListener('change', e => {
+  document.getElementById('ppPin').maxLength = parseInt(e.target.value, 10);
+});
+document.getElementById('ppForm').addEventListener('submit', async e => {
+  e.preventDefault();
+  const pin = document.getElementById('ppPin').value;
+  const length = parseInt(document.getElementById('ppLen').value, 10);
+  if (!/^\d+$/.test(pin) || pin.length !== length) { show('ppErr', 'PIN must be exactly ' + length + ' digits.'); return; }
+  try {
+    await api('POST', '/api/me/page-pin', { pin, length });
+    show('ppOk', 'Startpage PIN set.'); e.target.reset(); loadPagePin();
+  } catch (err) { show('ppErr', err.message); }
+});
+document.getElementById('ppRemove').addEventListener('click', async () => {
+  if (!confirm('Remove the PIN from your startpage? It becomes visible to everyone again.')) return;
+  try {
+    await api('POST', '/api/me/page-pin/remove', {});
+    show('ppOk', 'Startpage PIN removed.'); loadPagePin();
+  } catch (err) { show('ppErr', err.message); }
+});
 document.getElementById('logout').addEventListener('click', async () => {
   await fetch('/logout', { method: 'POST' }); location.href = '/';
 });
@@ -905,7 +948,7 @@ document.getElementById('logout').addEventListener('click', async () => {
   const s = await api('GET', '/api/me/session');
   CSRF = s.csrf; document.getElementById('who').textContent = s.username + ' (' + s.role + ')';
   document.getElementById('emAddr').value = s.email || '';
-  loadTokens(); loadMyShares().catch(() => {}); loadProfile().catch(() => {});
+  loadTokens(); loadMyShares().catch(() => {}); loadProfile().catch(() => {}); loadPagePin();
 })().catch(err => { document.getElementById('who').textContent = '—'; show('tokErr', err.message); });
 </script>"#;
     shell("My account — Startpage", inner)

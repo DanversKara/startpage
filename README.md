@@ -51,6 +51,16 @@ This edition adds a small **Rust** service (`server/`, binary
   instead of dying with a bare HTTP 413; both uploaders also check the
   8 MB limit in the browser first, so an oversized file gets a clear
   message instead of a round trip.
+- **Startpage PIN (v1.21.0):** any user can PIN-protect their startpage
+  from their /account page, with a 4, 6 or 12 digit PIN. Signed-out
+  visitors facing a protected page get no links, wallpaper or rotation
+  from the server at all — just a full-screen PIN gate — until a correct
+  PIN earns a 12-hour grant cookie. Five wrong PINs lock the IP out for
+  15 minutes (same bucket as logins). The owner never needs the PIN
+  while signed in and can change or remove it from /account any time;
+  admins cannot set or read anyone else's PIN. The PIN is deliberately
+  kept out of the folder-lock table, because /api/unlock has no IP
+  lockout and a 4-digit PIN must never be brute-forceable through it.
 
 ## Security model — and its honest limits
 

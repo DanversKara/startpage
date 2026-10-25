@@ -11,7 +11,7 @@
 
 const GRID = { ox: 24, oy: 55, uw: 120, uh: 124 };
 
-let S = { desktopIcons: [], dock: [], bookmarkSections: [{ blocks: [] }], about: [], branding: null, wallpaper: null, rotation: null };
+let S = { desktopIcons: [], dock: [], bookmarkSections: [{ blocks: [] }], about: [], branding: null, wallpaper: null, rotation: null, pinRequired: false, pinLen: null };
 let millerSel = 0;
 
 // ─────────────────────────────────────────────────────────────────────
@@ -87,10 +87,12 @@ async function loadState() {
 			branding: data.branding || null,
 			wallpaper: data.wallpaper || null,
 			rotation: data.rotation || null,
+			pinRequired: !!data.pin_required,
+			pinLen: data.pin_len || null,
 			csrf,
 		};
 	} catch (_) {
-		S = { desktopIcons: [], dock: [], bookmarkSections: [{ blocks: [] }], about: [], branding: null, wallpaper: null, rotation: null, csrf };
+		S = { desktopIcons: [], dock: [], bookmarkSections: [{ blocks: [] }], about: [], branding: null, wallpaper: null, rotation: null, pinRequired: false, pinLen: null, csrf };
 	}
 	ensureIconPositions();
 }
