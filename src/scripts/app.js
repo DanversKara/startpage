@@ -9,15 +9,6 @@ function setupEvents() {
 	});
 	$('mbBrand').addEventListener('click', e => { e.stopPropagation(); toggleAboutPanel(); });
 	$('mbWallpaper').addEventListener('click', () => { toggleWallpaperPanel(); });
-	$('mbDemo').addEventListener('click', () => {
-		try { localStorage.removeItem('startpage-demo-dismissed'); } catch (e) {}
-		$('demoBanner').classList.remove('hidden');
-	});
-	$('demoBannerClose').addEventListener('click', () => {
-		$('demoBanner').classList.add('hidden');
-		try { localStorage.setItem('startpage-demo-dismissed', '1'); } catch (e) {}
-	});
-	try { if (localStorage.getItem('startpage-demo-dismissed')) $('demoBanner').classList.add('hidden'); } catch (e) {}
 
 	$('dock').addEventListener('click', e => {
 		const launch = e.target.closest('.dock-icon, .dock-all-apps');

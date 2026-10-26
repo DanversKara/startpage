@@ -190,6 +190,35 @@ function setupAboutPanel() {
 	$('aboutClose').addEventListener('click', e => { e.stopPropagation(); closeAboutPanel(); });
 	$('aboutMin').addEventListener('click',   e => { e.stopPropagation(); closeAboutPanel(); });
 
+	// "See how it works" video in the About panel. Collapsed by default:
+	// the panel is centered from its height and its card clips instead of
+	// scrolling, so a permanent 16:9 embed would push the panel's foot
+	// off-screen on laptop viewports. The iframe is injected on first
+	// expand, so YouTube loads nothing until the user asks to watch.
+	$('aboutVideoToggle').addEventListener('click', () => {
+		const wrap = $('aboutVideoWrap');
+		const btn = $('aboutVideoToggle');
+		if (wrap.hasAttribute('hidden')) {
+			if (!wrap.querySelector('iframe')) {
+				const f = document.createElement('iframe');
+				f.src = 'https://www.youtube-nocookie.com/embed/dwrC1iu96_o?autoplay=1';
+				f.title = 'startpage os';
+				f.allow = 'accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share';
+				f.referrerPolicy = 'strict-origin-when-cross-origin';
+				f.allowFullscreen = true;
+				wrap.appendChild(f);
+			}
+			wrap.removeAttribute('hidden');
+			btn.textContent = '▼ See how it works';
+			btn.setAttribute('aria-expanded', 'true');
+		} else {
+			wrap.setAttribute('hidden', '');
+			btn.textContent = '▶ See how it works';
+			btn.setAttribute('aria-expanded', 'false');
+		}
+		centerAboutPanel();
+	});
+
 	// Positioned with absolute left/top; the `grabbing` cursor lives on the panel.
 	makeWindowDraggable($('aboutBar'), panel, panel, (left, top) => {
 		panel.style.left = left + 'px';
