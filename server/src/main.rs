@@ -1462,7 +1462,7 @@ async fn api_sync(State(st): State<Shared>, headers: HeaderMap) -> Response {
 fn default_branding() -> serde_json::Value {
     serde_json::json!({
         "product_name": "Bookmark OS",
-        "tagline": "Your bookmarks as a desktop — from any browser, no account needed.",
+        "tagline": "Your bookmarks as a desktop, in any browser — nothing to install, no extension required. And when school, cafe, or hotel Wi-Fi blocks this site, the extension keeps your bookmarks with you, offline, wherever you are.",
         "about_note": "Hi there, I’m the developer who built this lightweight web OS. The idea was simple: to access my bookmarks using ANY browser on ANY computer, without logging in to a stupid FUCKING account. To learn more about me, you’re welcome to click one of the icons below.",
         "profile_name": "Marc Cheng",
         "profile_sub": "Zhongmang Cheng",
