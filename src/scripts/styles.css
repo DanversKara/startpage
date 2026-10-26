@@ -1028,7 +1028,13 @@ body::after {
     box-shadow: var(--shadow-window);
     display: flex;
     flex-direction: column;
-    overflow: hidden;
+    /* Scroll inside the card: the panel is centered from its height and
+       never scrolls the page, so without this a tall card (e.g. the
+       expanded About video) runs off the bottom of the viewport with
+       its foot unreachable. 80px leaves the 40px top clamp plus room. */
+    overflow-x: hidden;
+    overflow-y: auto;
+    max-height: calc(100vh - 80px);
     color: var(--color-name);
     opacity: 0;
     transition: opacity 0.28s ease;
