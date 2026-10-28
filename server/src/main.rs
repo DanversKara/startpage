@@ -907,7 +907,14 @@ async fn api_links_move(State(st): State<Shared>, headers: HeaderMap, Json(input
         }
         match link_full(&db, fid) {
             Some(f) if f.owner_id == sess.user.id && f.kind == "folder" && f.section == "desktop" => {
-                let _ = db.execute("UPDATE links SET folder_id = ?1, col = NULL, row = NULL WHERE id = ?2", params![fid, input.id]);
+                // A new member appends at the END of the folder's order:
+                // its old desktop sort is meaningless inside a folder, and
+                // keeping it would park the app at an arbitrary position
+                // the owner can only fix by dragging (v1.23.0).
+                let max_sort: i64 = db.query_row(
+                    "SELECT COALESCE(MAX(sort), -1) FROM links WHERE folder_id = ?1",
+                    params![fid], |r| r.get(0)).unwrap_or(-1);
+                let _ = db.execute("UPDATE links SET folder_id = ?1, col = NULL, row = NULL, sort = ?2 WHERE id = ?3", params![fid, max_sort + 1, input.id]);
                 return json_response(StatusCode::OK, serde_json::json!({ "ok": true }));
             }
             _ => return json_response(StatusCode::BAD_REQUEST, serde_json::json!({ "error": "no such folder" })),
@@ -1025,6 +1032,58 @@ async fn api_links_folder_delete(State(st): State<Shared>, headers: HeaderMap, J
         }
         _ => json_response(StatusCode::NOT_FOUND, serde_json::json!({ "error": "no such folder" })),
     }
+}
+
+#[derive(Deserialize)]
+struct FolderOrderReq {
+    id: String,
+    order: Vec<String>,
+}
+
+/// POST /api/links/folder-order — reorder a folder's members (v1.23.0).
+/// The client sends the member ids top-to-bottom; that becomes the
+/// members' `sort` order, which is what both the folder tile mosaic
+/// (first four) and the open folder render. Members missing from the
+/// list keep their relative order after the listed ones, so a stale
+/// client can never silently drop a member by reordering.
+async fn api_links_folder_order(State(st): State<Shared>, headers: HeaderMap, Json(input): Json<FolderOrderReq>) -> Response {
+    let sess = match session_from_headers(&st, &headers) {
+        Some(s) => s,
+        None => return json_response(StatusCode::UNAUTHORIZED, serde_json::json!({ "error": "sign in first" })),
+    };
+    if let Err(r) = require_csrf(&sess, &headers) { return r; }
+    if input.order.len() > 500 {
+        return json_response(StatusCode::BAD_REQUEST, serde_json::json!({ "error": "order too long" }));
+    }
+    let db = st.db.lock().unwrap();
+    match link_full(&db, &input.id) {
+        Some(l) if l.owner_id == sess.user.id && l.kind == "folder" => {}
+        _ => return json_response(StatusCode::NOT_FOUND, serde_json::json!({ "error": "no such folder" })),
+    }
+    let mut stmt = match db.prepare("SELECT id FROM links WHERE folder_id = ?1 AND owner_id = ?2 ORDER BY sort") {
+        Ok(s) => s,
+        Err(_) => return json_response(StatusCode::INTERNAL_SERVER_ERROR, serde_json::json!({ "error": "db error" })),
+    };
+    let members: Vec<String> = stmt
+        .query_map(params![input.id, sess.user.id], |r| r.get::<_, String>(0))
+        .map(|q| q.filter_map(|x| x.ok()).collect())
+        .unwrap_or_default();
+    drop(stmt);
+    let mut next: Vec<String> = Vec::new();
+    for id in &input.order {
+        if members.contains(id) && !next.contains(id) {
+            next.push(id.clone());
+        }
+    }
+    for id in &members {
+        if !next.contains(id) {
+            next.push(id.clone());
+        }
+    }
+    for (pos, id) in next.iter().enumerate() {
+        let _ = db.execute("UPDATE links SET sort = ?1 WHERE id = ?2", params![pos as i64, id]);
+    }
+    json_response(StatusCode::OK, serde_json::json!({ "ok": true }))
 }
 
 /// /go/<id> — resolve only links owned by the admin (public set) or by the
@@ -5812,6 +5871,7 @@ async fn main() {
         .route("/api/links/folder", post(api_links_folder))
         .route("/api/links/folder-rename", post(api_links_folder_rename))
         .route("/api/links/folder-delete", post(api_links_folder_delete))
+        .route("/api/links/folder-order", post(api_links_folder_order))
         .route("/api/sync", get(api_sync))
         .route("/go/:id", get(go))
         .route("/icon/:id", get(icon))

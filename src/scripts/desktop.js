@@ -187,23 +187,92 @@ function openFolder(id, keepManage) {
 
 // The no-drag way to build a folder: tick the apps that belong in it.
 // Members are checked; every other desktop app is a tick away. Changes
-// apply immediately.
+// apply immediately. Members can also be dragged by their ⋮⋮ handle:
+// top-to-bottom in this list is the order the folder tile shows (its
+// first four icons) and the order the open folder lists them in.
 function renderFolderManage(folder) {
 	const list = folderPopEl.querySelector('.folder-manage-list');
 	list.innerHTML = '';
-	const rows = [];
-	(folder.members || []).forEach(m => rows.push({ item: m, inside: true }));
-	S.desktopIcons.forEach(i => { if (!i.folder && i.id !== folder.id) rows.push({ item: i, inside: false }); });
-	if (!rows.length) {
+	const members = folder.members || [];
+	const others = S.desktopIcons.filter(i => !i.folder && i.id !== folder.id);
+	if (!members.length && !others.length) {
 		list.appendChild(el('div', { class: 'sub', text: 'No desktop apps to add yet.' }));
 		return;
 	}
-	rows.forEach(({ item, inside }) => {
+	if (members.length) {
+		list.appendChild(el('div', { class: 'folder-manage-hint', text: 'Drag ⋮⋮ to reorder — top to bottom is the order shown on the folder tile.' }));
+		members.forEach(m => {
+			const cb = el('input', { type: 'checkbox' });
+			cb.checked = true;
+			cb.addEventListener('change', () => toggleFolderMember(folder, m, cb.checked));
+			const handle = el('span', { class: 'folder-drag-handle', draggable: true, title: 'Drag to reorder', text: '⋮⋮' });
+			handle.addEventListener('dragstart', e => startMemberOrderDrag(e, m.id));
+			handle.addEventListener('dragend', clearMemberOrderIndicators);
+			// A click on the handle must not also tick the checkbox
+			// (the row is a <label>, so clicks inside it toggle).
+			handle.addEventListener('click', e => { e.preventDefault(); e.stopPropagation(); });
+			const row = el('label', { class: 'folder-manage-row member', data: { key: m.id } }, handle, cb, iconArt(m), el('span', { text: m.label }));
+			row.addEventListener('dragover', e => memberOrderDragOver(e, row));
+			row.addEventListener('dragleave', e => { if (!row.contains(e.relatedTarget)) row.classList.remove('drop-before', 'drop-after'); });
+			row.addEventListener('drop', e => memberOrderDrop(e, folder, row));
+			list.appendChild(row);
+		});
+	}
+	others.forEach(i => {
 		const cb = el('input', { type: 'checkbox' });
-		cb.checked = inside;
-		cb.addEventListener('change', () => toggleFolderMember(folder, item, cb.checked));
-		list.appendChild(el('label', { class: 'folder-manage-row' }, cb, iconArt(item), el('span', { text: item.label })));
+		cb.addEventListener('change', () => toggleFolderMember(folder, i, cb.checked));
+		list.appendChild(el('label', { class: 'folder-manage-row' }, cb, iconArt(i), el('span', { text: i.label })));
 	});
+}
+
+// Reordering inside the Add-apps list (v1.23.0). Only member rows are
+// drag sources (their ⋮⋮ handle) and drop targets; the not-yet-added
+// rows below stay plain checkboxes.
+let memberOrderDragId = null;
+
+function startMemberOrderDrag(e, id) {
+	memberOrderDragId = id;
+	e.dataTransfer.effectAllowed = 'move';
+	try { e.dataTransfer.setData('text/plain', id); } catch (_) { /* drag still works without payload */ }
+}
+
+function memberOrderDragOver(e, row) {
+	if (!memberOrderDragId || row.dataset.key === memberOrderDragId) return;
+	e.preventDefault();
+	e.dataTransfer.dropEffect = 'move';
+	const rect = row.getBoundingClientRect();
+	const after = (e.clientY - rect.top) > rect.height / 2;
+	row.classList.toggle('drop-before', !after);
+	row.classList.toggle('drop-after', after);
+}
+
+function clearMemberOrderIndicators() {
+	memberOrderDragId = null;
+	document.querySelectorAll('.folder-manage-row.drop-before, .folder-manage-row.drop-after').forEach(r => r.classList.remove('drop-before', 'drop-after'));
+}
+
+async function memberOrderDrop(e, folder, row) {
+	e.preventDefault();
+	const draggedId = memberOrderDragId;
+	const list = folderPopEl.querySelector('.folder-manage-list');
+	list.querySelectorAll('.folder-manage-row.drop-before, .folder-manage-row.drop-after').forEach(r => r.classList.remove('drop-before', 'drop-after'));
+	memberOrderDragId = null;
+	if (!draggedId || row.dataset.key === draggedId) return;
+	const draggedRow = [...list.querySelectorAll('.folder-manage-row.member')].find(r => r.dataset.key === draggedId);
+	if (!draggedRow) return;
+	const rect = row.getBoundingClientRect();
+	if ((e.clientY - rect.top) > rect.height / 2) row.after(draggedRow);
+	else row.before(draggedRow);
+	const order = [...list.querySelectorAll('.folder-manage-row.member')].map(r => r.dataset.key);
+	try {
+		const r = await fetch('/api/links/folder-order', {
+			method: 'POST',
+			headers: { 'Content-Type': 'application/json', 'X-CSRF-Token': S.csrf || '' },
+			body: JSON.stringify({ id: folder.id, order }),
+		});
+		if (!r.ok) throw new Error('order rejected');
+	} catch (_) { /* the refresh below shows the server's truth */ }
+	afterFolderChange();
 }
 
 async function toggleFolderMember(folder, item, join) {

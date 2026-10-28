@@ -72,6 +72,15 @@ This edition adds a small **Rust** service (`server/`, binary
   via YouTube's privacy-enhanced embed (no cookies until you press
   play). The video is also linked at the top of this README under
   "See it in action".
+- **Folder icon order (v1.23.0):** a folder's tile shows its first four
+  members, and until now that order was whatever each app's old desktop
+  sort happened to be — there was no way to change it. Now, in Edit
+  Desktop mode, opening a folder and tapping Add apps gives every member
+  a ⋮⋮ drag handle: drag top-to-bottom into the order you want, and the
+  tile mosaic plus the open folder follow it. Newly ticked apps append
+  at the bottom instead of landing at an arbitrary spot, and the order
+  is stored server-side per folder (`POST /api/links/folder-order`), so
+  it survives rebuilds and shows the same for signed-out visitors.
 
 ## Security model — and its honest limits
 

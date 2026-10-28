@@ -582,6 +582,11 @@ body::after {
 			.folder-manage-row:hover { background: var(--w-12); }
 			.folder-manage-row input { width: 18px; height: 18px; accent-color: #6ab0ff; flex: 0 0 auto; }
 			.folder-manage-row .icon-art { width: 28px; height: 28px; flex: 0 0 auto; }
+			.folder-manage-hint { font-size: .8rem; color: var(--w-65, rgba(255,255,255,.65)); padding: 2px 8px 8px; }
+			.folder-drag-handle { cursor: grab; color: var(--w-55, rgba(255,255,255,.55)); font-size: .9rem; letter-spacing: -1px; flex: 0 0 auto; padding: 2px 0; }
+			.folder-drag-handle:active { cursor: grabbing; }
+			.folder-manage-row.drop-before { box-shadow: inset 0 2px 0 var(--w-85); }
+			.folder-manage-row.drop-after { box-shadow: inset 0 -2px 0 var(--w-85); }
 			.folder-actions { margin-top: 14px; text-align: center; }
 			.folder-remove {
 				background: transparent; border: 1px solid var(--w-22, rgba(255,255,255,.22));
