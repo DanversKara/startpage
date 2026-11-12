@@ -81,6 +81,16 @@ This edition adds a small **Rust** service (`server/`, binary
   at the bottom instead of landing at an arbitrary spot, and the order
   is stored server-side per folder (`POST /api/links/folder-order`), so
   it survives rebuilds and shows the same for signed-out visitors.
+- **Custom HTML widgets (v1.24.0):** in Edit Desktop mode, the strip
+  above the dock gains an ＋ Add widget card: paste any HTML / embed
+  snippet (title + code) and it renders on your own desktop — including
+  `<script>` tags, which the page re-creates as real elements so they
+  actually run. Widgets are strictly per-user: the server only ever
+  sends them in `/api/state` when the viewer IS the owner, so a
+  signed-out visitor or another user's profile never sees anyone's
+  widgets, and they are never rendered on public/shared pages. Each
+  widget can be edited, deleted, or moved left/right from its card
+  header in Edit Desktop mode.
 
 ## Security model — and its honest limits
 

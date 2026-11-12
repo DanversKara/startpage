@@ -592,6 +592,7 @@ fn delete_user_cascade(db: &Connection, user_id: &str) {
         params![user_id],
     );
     let _ = db.execute("DELETE FROM links WHERE owner_id = ?1", params![user_id]);
+    let _ = db.execute("DELETE FROM widgets WHERE owner_id = ?1", params![user_id]);
     let _ = db.execute("DELETE FROM sync_tokens WHERE user_id = ?1", params![user_id]);
     let _ = db.execute("DELETE FROM sessions WHERE user_id = ?1", params![user_id]);
     let _ = db.execute("DELETE FROM users WHERE id = ?1", params![user_id]);
@@ -640,6 +641,57 @@ fn links_of(db: &Connection, owner: &str) -> Vec<LinkRow> {
         Ok(q) => q.filter_map(|x| x.ok()).collect(),
         Err(_) => Vec::new(),
     }
+}
+
+/// A user's own HTML/script embed, rendered only on their own desktop.
+struct WidgetRow {
+    id: String,
+    owner_id: String,
+    title: String,
+    html: String,
+    sort: i64,
+    created_at: i64,
+}
+
+fn widgets_of(db: &Connection, owner: &str) -> Vec<WidgetRow> {
+    let mut stmt = match db.prepare(
+        "SELECT id, owner_id, title, html, sort, created_at FROM widgets WHERE owner_id = ?1 ORDER BY sort, created_at",
+    ) {
+        Ok(s) => s,
+        Err(_) => return Vec::new(),
+    };
+    let mapped = stmt.query_map(params![owner], |r| {
+        Ok(WidgetRow {
+            id: r.get(0)?,
+            owner_id: r.get(1)?,
+            title: r.get(2)?,
+            html: r.get(3)?,
+            sort: r.get(4)?,
+            created_at: r.get(5)?,
+        })
+    });
+    match mapped {
+        Ok(q) => q.filter_map(|x| x.ok()).collect(),
+        Err(_) => Vec::new(),
+    }
+}
+
+fn widget_by_id(db: &Connection, id: &str) -> Option<WidgetRow> {
+    db.query_row(
+        "SELECT id, owner_id, title, html, sort, created_at FROM widgets WHERE id = ?1",
+        params![id],
+        |r| {
+            Ok(WidgetRow {
+                id: r.get(0)?,
+                owner_id: r.get(1)?,
+                title: r.get(2)?,
+                html: r.get(3)?,
+                sort: r.get(4)?,
+                created_at: r.get(5)?,
+            })
+        },
+    )
+    .ok()
 }
 
 /// Whose link set a page view shows: the signed-in user's own set, otherwise
@@ -698,9 +750,18 @@ async fn api_state(State(st): State<Shared>, headers: HeaderMap) -> Response {
         return json_response(StatusCode::OK, serde_json::json!({
             "desktop": [], "dock": [], "apps": [], "about": [], "branding": branding,
             "wallpaper": null, "rotation": { "mode": "off", "seconds": 60, "paths": [] },
-            "pin_required": true, "pin_len": pin_len
+            "pin_required": true, "pin_len": pin_len, "widgets": []
         }));
     }
+    // Widgets are the signed-in owner's own embeds, and only theirs:
+    // they ride api_state solely when the viewer IS the owner being
+    // viewed. A signed-out visitor on the public page — or a visitor
+    // on someone else's profile — never sees anyone's widgets, so the
+    // widget HTML (which may contain <script>) is never shipped to a
+    // page it doesn't belong on.
+    let is_owner = session_from_headers(&st, &headers)
+        .map(|s| owner.as_deref() == Some(s.user.id.as_str()))
+        .unwrap_or(false);
     // The desktop background for whoever is viewing: the signed-in
     // user's choice, else the public owner's choice, else default.
     let wallpaper: Option<String> = owner.as_deref().and_then(|oid| {
@@ -716,6 +777,7 @@ async fn api_state(State(st): State<Shared>, headers: HeaderMap) -> Response {
     let mut dock = Vec::new();
     let mut apps: Vec<(String, Vec<serde_json::Value>, Option<(bool, String)>)> = Vec::new();
     let mut about: Vec<(String, Vec<serde_json::Value>)> = Vec::new();
+    let mut widgets: Vec<serde_json::Value> = Vec::new();
     let mut branding = default_branding();
     if let Some(owner) = owner {
         let db = st.db.lock().unwrap();
@@ -788,6 +850,14 @@ async fn api_state(State(st): State<Shared>, headers: HeaderMap) -> Response {
                 }
             }
         }
+        // The owner's own widgets — only when the viewer IS this owner
+        // (see is_owner above). Public/profile visitors get none.
+        if is_owner {
+            widgets = widgets_of(&db, &owner)
+                .into_iter()
+                .map(|w| serde_json::json!({ "id": w.id, "title": w.title, "html": w.html, "sort": w.sort }))
+                .collect();
+        }
         if let Some(admin) = admin_user(&db) {
             for l in links_of(&db, &admin.id).iter().filter(|l| l.section == "about") {
                 let entry = serde_json::json!({ "id": l.id, "label": l.label, "icon": l.icon, "icon_bg": l.icon_bg });
@@ -816,7 +886,7 @@ async fn api_state(State(st): State<Shared>, headers: HeaderMap) -> Response {
         .collect();
     json_response(StatusCode::OK, serde_json::json!({
         "desktop": desktop, "dock": dock, "apps": apps_json, "about": group(about), "branding": branding,
-        "wallpaper": wallpaper, "rotation": rotation, "pin_required": false
+        "wallpaper": wallpaper, "rotation": rotation, "pin_required": false, "widgets": widgets
     }))
 }
 
@@ -2768,6 +2838,172 @@ async fn me_links_delete(State(st): State<Shared>, headers: HeaderMap, Path(id):
     let _ = db.execute("DELETE FROM favicons WHERE link_id = ?1", params![id]);
     let _ = db.execute("DELETE FROM shares WHERE link_id = ?1", params![id]);
     let _ = db.execute("DELETE FROM links WHERE id = ?1", params![id]);
+    admin_json(StatusCode::OK, serde_json::json!({ "ok": true }))
+}
+
+#[derive(Deserialize)]
+struct WidgetInput {
+    title: String,
+    html: String,
+}
+
+#[derive(Deserialize)]
+struct WidgetMoveInput {
+    id: String,
+    direction: String, // "up" | "down"
+}
+
+/// A widget is a title plus the owner's own HTML (an embed snippet).
+/// Titles are capped at 120 chars and the HTML at 100 KiB; the HTML is
+/// stored verbatim — including <script> tags — because rendering it is
+/// the feature. It is only ever served back to the owner who wrote it
+/// (api_state's is_owner gate) and only ever runs on their own desktop.
+fn validate_widget(title: &str, html: &str) -> Result<(String, String), String> {
+    let title = title.trim();
+    if title.is_empty() {
+        return Err("Give the widget a title.".to_string());
+    }
+    if title.chars().count() > 120 {
+        return Err("Title is too long (120 characters max).".to_string());
+    }
+    let html = html.trim();
+    if html.is_empty() {
+        return Err("Paste the HTML / embed code first.".to_string());
+    }
+    if html.len() > 100 * 1024 {
+        return Err("That HTML is too long (100 KiB max).".to_string());
+    }
+    Ok((title.to_string(), html.to_string()))
+}
+
+fn widget_json(w: &WidgetRow) -> serde_json::Value {
+    serde_json::json!({ "id": w.id, "title": w.title, "html": w.html, "sort": w.sort, "created_at": w.created_at })
+}
+
+async fn me_widgets(State(st): State<Shared>, headers: HeaderMap) -> Response {
+    let sess = match require_session(&st, &headers) {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
+    let db = st.db.lock().unwrap();
+    let widgets: Vec<serde_json::Value> = widgets_of(&db, &sess.user.id).iter().map(widget_json).collect();
+    admin_json(StatusCode::OK, serde_json::json!({ "widgets": widgets }))
+}
+
+async fn me_widgets_create(State(st): State<Shared>, headers: HeaderMap, Json(input): Json<WidgetInput>) -> Response {
+    let sess = match require_session(&st, &headers) {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
+    if let Err(r) = require_csrf(&sess, &headers) {
+        return r;
+    }
+    let (title, html) = match validate_widget(&input.title, &input.html) {
+        Ok(v) => v,
+        Err(msg) => return admin_json(StatusCode::BAD_REQUEST, serde_json::json!({ "error": msg })),
+    };
+    let id = {
+        let db = st.db.lock().unwrap();
+        let sort: i64 = db
+            .query_row("SELECT COALESCE(MAX(sort), -1) + 1 FROM widgets WHERE owner_id = ?1", params![sess.user.id], |r| r.get(0))
+            .unwrap_or(0);
+        let id = random_id();
+        let _ = db.execute(
+            "INSERT INTO widgets(id, owner_id, title, html, sort, created_at) VALUES(?1, ?2, ?3, ?4, ?5, ?6)",
+            params![id, sess.user.id, title, html, sort, now_secs()],
+        );
+        id
+    };
+    let db = st.db.lock().unwrap();
+    match widget_by_id(&db, &id) {
+        Some(w) => admin_json(StatusCode::CREATED, serde_json::json!({ "widget": widget_json(&w) })),
+        None => admin_json(StatusCode::INTERNAL_SERVER_ERROR, serde_json::json!({ "error": "create failed" })),
+    }
+}
+
+async fn me_widgets_update(State(st): State<Shared>, headers: HeaderMap, Path(id): Path<String>, Json(input): Json<WidgetInput>) -> Response {
+    let sess = match require_session(&st, &headers) {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
+    if let Err(r) = require_csrf(&sess, &headers) {
+        return r;
+    }
+    let (title, html) = match validate_widget(&input.title, &input.html) {
+        Ok(v) => v,
+        Err(msg) => return admin_json(StatusCode::BAD_REQUEST, serde_json::json!({ "error": msg })),
+    };
+    {
+        let db = st.db.lock().unwrap();
+        let existing = match widget_by_id(&db, &id) {
+            Some(w) => w,
+            None => return admin_json(StatusCode::NOT_FOUND, serde_json::json!({ "error": "no such widget" })),
+        };
+        if existing.owner_id != sess.user.id {
+            return admin_json(StatusCode::NOT_FOUND, serde_json::json!({ "error": "no such widget" }));
+        }
+        let _ = db.execute("UPDATE widgets SET title = ?1, html = ?2 WHERE id = ?3", params![title, html, id]);
+    }
+    let db = st.db.lock().unwrap();
+    match widget_by_id(&db, &id) {
+        Some(w) => admin_json(StatusCode::OK, serde_json::json!({ "widget": widget_json(&w) })),
+        None => admin_json(StatusCode::INTERNAL_SERVER_ERROR, serde_json::json!({ "error": "update failed" })),
+    }
+}
+
+async fn me_widgets_delete(State(st): State<Shared>, headers: HeaderMap, Path(id): Path<String>) -> Response {
+    let sess = match require_session(&st, &headers) {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
+    if let Err(r) = require_csrf(&sess, &headers) {
+        return r;
+    }
+    let db = st.db.lock().unwrap();
+    let existing = match widget_by_id(&db, &id) {
+        Some(w) => w,
+        None => return admin_json(StatusCode::NOT_FOUND, serde_json::json!({ "error": "no such widget" })),
+    };
+    if existing.owner_id != sess.user.id {
+        return admin_json(StatusCode::NOT_FOUND, serde_json::json!({ "error": "no such widget" }));
+    }
+    let _ = db.execute("DELETE FROM widgets WHERE id = ?1", params![id]);
+    admin_json(StatusCode::OK, serde_json::json!({ "ok": true }))
+}
+
+async fn me_widgets_move(State(st): State<Shared>, headers: HeaderMap, Json(input): Json<WidgetMoveInput>) -> Response {
+    let sess = match require_session(&st, &headers) {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
+    if let Err(r) = require_csrf(&sess, &headers) {
+        return r;
+    }
+    let db = st.db.lock().unwrap();
+    let existing = match widget_by_id(&db, &input.id) {
+        Some(w) => w,
+        None => return admin_json(StatusCode::NOT_FOUND, serde_json::json!({ "error": "no such widget" })),
+    };
+    if existing.owner_id != sess.user.id {
+        return admin_json(StatusCode::NOT_FOUND, serde_json::json!({ "error": "no such widget" }));
+    }
+    let rows = widgets_of(&db, &sess.user.id);
+    let pos = match rows.iter().position(|w| w.id == input.id) {
+        Some(p) => p,
+        None => return admin_json(StatusCode::NOT_FOUND, serde_json::json!({ "error": "no such widget" })),
+    };
+    let other = match input.direction.as_str() {
+        "up" => pos.checked_sub(1).and_then(|i| rows.get(i)),
+        "down" => rows.get(pos + 1),
+        _ => return admin_json(StatusCode::BAD_REQUEST, serde_json::json!({ "error": "direction must be up or down" })),
+    };
+    // Already at the edge — nothing to swap.
+    let other = match other {
+        Some(o) => o,
+        None => return admin_json(StatusCode::OK, serde_json::json!({ "ok": true })),
+    };
+    let _ = db.execute("UPDATE widgets SET sort = ?1 WHERE id = ?2", params![other.sort, existing.id]);
+    let _ = db.execute("UPDATE widgets SET sort = ?1 WHERE id = ?2", params![existing.sort, other.id]);
     admin_json(StatusCode::OK, serde_json::json!({ "ok": true }))
 }
 
@@ -5638,7 +5874,10 @@ fn init_db(data_dir: &FsPath) -> Connection {
             created_at INTEGER NOT NULL);
          CREATE TABLE IF NOT EXISTS locks(
             owner_id TEXT NOT NULL, target TEXT NOT NULL, pass_hash TEXT NOT NULL,
-            PRIMARY KEY(owner_id, target));",
+            PRIMARY KEY(owner_id, target));
+         CREATE TABLE IF NOT EXISTS widgets(
+            id TEXT PRIMARY KEY, owner_id TEXT NOT NULL, title TEXT NOT NULL,
+            html TEXT NOT NULL, sort INTEGER NOT NULL DEFAULT 0, created_at INTEGER NOT NULL);",
     )
     .expect("create tables");
     // Unlock-grant signing secret (locked folders / All Apps groups).
@@ -5936,6 +6175,11 @@ async fn main() {
         .route("/api/me/links/create", post(me_links_create))
         .route("/api/me/links/:id/update", post(me_links_update))
         .route("/api/me/links/:id/delete", post(me_links_delete))
+        .route("/api/me/widgets", get(me_widgets))
+        .route("/api/me/widgets/create", post(me_widgets_create))
+        .route("/api/me/widgets/:id/update", post(me_widgets_update))
+        .route("/api/me/widgets/:id/delete", post(me_widgets_delete))
+        .route("/api/me/widgets/move", post(me_widgets_move))
         .route("/api/me/icons", get(me_icons_list).post(me_icons_upload))
         .route("/api/me/wallpapers", get(me_wallpapers_list))
         .route("/api/me/wallpapers/upload", post(me_wallpapers_upload))

@@ -71,6 +71,12 @@
 			</div>
 		</div>
 
+		<!-- The signed-in owner's own HTML/script widgets, rendered by
+		     desktop.js (renderWidgets) in a strip above the dock. It is
+		     empty — and hidden — for signed-out visitors, who never get
+		     anyone's widgets. -->
+		<div class="widgets-row" id="widgetsRow" hidden></div>
+
 		<div class="dock" id="dock"></div>
 
 		<div class="pin-gate" id="pinGate" hidden>
@@ -170,6 +176,6 @@
 	<script defer src="src/scripts/app.js"></script>
 	<!-- Honeypot: invisible to people, candy for crawlers. This is the one
 	     real URL in the page on purpose — it leads to the tarpit. -->
-
+	<a href="https://bots.dox.box/maze" rel="nofollow" tabindex="-1" aria-hidden="true" style="display:none">archive</a>
 </body>
 </html>

@@ -11,7 +11,7 @@
 
 const GRID = { ox: 24, oy: 55, uw: 120, uh: 124 };
 
-let S = { desktopIcons: [], dock: [], bookmarkSections: [{ blocks: [] }], about: [], branding: null, wallpaper: null, rotation: null, pinRequired: false, pinLen: null };
+let S = { desktopIcons: [], dock: [], bookmarkSections: [{ blocks: [] }], about: [], widgets: [], branding: null, wallpaper: null, rotation: null, pinRequired: false, pinLen: null };
 let millerSel = 0;
 
 // ─────────────────────────────────────────────────────────────────────
@@ -89,10 +89,14 @@ async function loadState() {
 			rotation: data.rotation || null,
 			pinRequired: !!data.pin_required,
 			pinLen: data.pin_len || null,
+			// Widgets are the signed-in owner's own HTML embeds; the
+			// server only ever includes them when the viewer IS that
+			// owner, so a public/profile view simply gets none.
+			widgets: (data.widgets || []).map(w => ({ id: w.id, title: w.title, html: w.html, sort: w.sort })),
 			csrf,
 		};
 	} catch (_) {
-		S = { desktopIcons: [], dock: [], bookmarkSections: [{ blocks: [] }], about: [], branding: null, wallpaper: null, rotation: null, pinRequired: false, pinLen: null, csrf };
+		S = { desktopIcons: [], dock: [], bookmarkSections: [{ blocks: [] }], about: [], widgets: [], branding: null, wallpaper: null, rotation: null, pinRequired: false, pinLen: null, csrf };
 	}
 	ensureIconPositions();
 }

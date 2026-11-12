@@ -77,6 +77,61 @@ function renderDesktopIcons() {
 }
 
 // ─────────────────────────────────────────────────────────────────────
+// Widgets — the signed-in owner's own HTML/script embeds, rendered in a
+// strip above the dock. The server only ever sends widgets when the
+// viewer IS the owner, so a public/profile page simply has none.
+// ─────────────────────────────────────────────────────────────────────
+function injectWidgetHtml(container, html) {
+	// innerHTML never runs <script> tags — and running them is the
+	// whole point of a widget embed. So after the static markup lands,
+	// every script is re-created as a real element (same attributes
+	// and inline code), which the browser does execute. document.
+	// currentScript inside the widget therefore still points at the
+	// widget's own tag, with its data-* attributes intact.
+	container.innerHTML = html;
+	Array.from(container.querySelectorAll('script')).forEach(old => {
+		const s = document.createElement('script');
+		for (const attr of old.attributes) s.setAttribute(attr.name, attr.value);
+		s.textContent = old.textContent;
+		old.replaceWith(s);
+	});
+}
+
+function renderWidgets() {
+	const row = $('widgetsRow');
+	if (!row) return;
+	const widgets = S.widgets || [];
+	row.innerHTML = '';
+	// Nothing to show and nothing to add: keep the strip out of the way.
+	row.hidden = widgets.length === 0 && !(desktopEditing && S.csrf);
+	widgets.forEach(w => {
+		const head = el('div', { class: 'widget-head' },
+			el('span', { class: 'widget-title', text: w.title }),
+		);
+		if (desktopEditing && S.csrf) {
+			head.appendChild(el('span', { class: 'widget-controls' },
+				el('button', { class: 'widget-btn', type: 'button', text: '←', title: 'Move left', onclick: e => { e.stopPropagation(); moveWidget(w.id, 'up'); } }),
+				el('button', { class: 'widget-btn', type: 'button', text: '→', title: 'Move right', onclick: e => { e.stopPropagation(); moveWidget(w.id, 'down'); } }),
+				el('button', { class: 'widget-btn', type: 'button', text: 'Edit', title: 'Edit widget', onclick: e => { e.stopPropagation(); openWidgetSheet(w.id); } }),
+				el('button', { class: 'widget-btn widget-btn-del', type: 'button', text: '✕', title: 'Delete widget', onclick: e => { e.stopPropagation(); deleteWidget(w.id); } }),
+			));
+		}
+		const body = el('div', { class: 'widget-body' });
+		row.appendChild(el('div', { class: 'widget-card' }, head, body));
+		injectWidgetHtml(body, w.html);
+	});
+	// In edit mode the owner gets an ＋ Add widget card at the end.
+	if (desktopEditing && S.csrf) {
+		const add = el('div', { class: 'widget-card widget-add', role: 'button', tabindex: '0', title: 'Add a widget' },
+			el('div', { class: 'widget-add-plus', text: '＋' }),
+			el('span', { class: 'widget-add-label', text: 'Add widget' }),
+		);
+		add.addEventListener('pointerup', e => { e.stopPropagation(); openWidgetSheet(null); });
+		row.appendChild(add);
+	}
+}
+
+// ─────────────────────────────────────────────────────────────────────
 // Folder popover — tap a folder tile to open it. Members are ordinary
 // links. While signed in, the title renames the folder; in Edit Desktop
 // mode members can be dragged out onto the grid and the folder removed.
@@ -1077,6 +1132,7 @@ function closeLinkSheet() {
 async function refreshAfterLinkChange() {
 	await loadState();
 	renderDesktopIcons();
+	renderWidgets();
 	renderDock();
 	if (openFolderId) {
 		const still = S.desktopIcons.find(i => i.id === openFolderId && i.folder);
@@ -1136,6 +1192,107 @@ async function deleteLinkSheet() {
 		closeLinkSheet();
 		await refreshAfterLinkChange();
 	} catch (err) { F.msg.textContent = err.message; }
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// Widget sheet — add/edit a widget (Title + HTML embed code). Follows
+// the link sheet: one dialog built once, refs in pop._f.
+// ─────────────────────────────────────────────────────────────────────
+let widgetSheetEl = null;
+let wsRow = null; // the widget being edited (null = new)
+
+function ensureWidgetSheet() {
+	if (widgetSheetEl) return widgetSheetEl;
+	const field = (labelText, node) => el('div', { class: 'ls-field' }, el('label', { text: labelText }), node);
+	const title = el('h3', { class: 'ls-title', text: 'Add widget' });
+	const titleIn = el('input', { class: 'ls-input', maxlength: 120, placeholder: 'Widget title' });
+	const htmlIn = el('textarea', { class: 'ls-input ls-textarea', placeholder: '<script src="https://pbx.ownpbx.org/widget.js" data-widget="w_…" async></script>', spellcheck: false, rows: 8 });
+	const note = el('p', { class: 'ls-note', text: 'Paste your own HTML / embed code — it runs as-is on your desktop, including <script> tags. Only you ever see it.' });
+	const msg = el('p', { class: 'report-msg ls-msg' });
+	const delBtn = el('button', { class: 'report-btn ls-delete', type: 'button', text: 'Delete' });
+	const cancelBtn = el('button', { class: 'report-btn', type: 'button', text: 'Cancel' });
+	const saveBtn = el('button', { class: 'report-btn primary', type: 'button', text: 'Save' });
+	const card = el('div', { class: 'link-sheet-card' },
+		title, field('Title', titleIn), field('HTML / embed code', htmlIn), note, msg,
+		el('div', { class: 'report-actions ls-actions' }, delBtn, el('span', { class: 'ls-spacer' }), cancelBtn, saveBtn),
+	);
+	const pop = el('div', { class: 'link-sheet', hidden: true }, card);
+	pop.addEventListener('pointerdown', e => { if (e.target === pop) closeWidgetSheet(); });
+	document.body.appendChild(pop);
+	widgetSheetEl = pop;
+	pop._f = { title, titleIn, htmlIn, msg, delBtn, saveBtn };
+	cancelBtn.addEventListener('click', () => closeWidgetSheet());
+	saveBtn.addEventListener('click', () => saveWidgetSheet());
+	delBtn.addEventListener('click', () => deleteWidgetSheet());
+	return pop;
+}
+
+function openWidgetSheet(id) {
+	const pop = ensureWidgetSheet();
+	const F = pop._f;
+	wsRow = id ? (S.widgets || []).find(w => w.id === id) : null;
+	F.title.textContent = wsRow ? 'Edit widget' : 'Add widget';
+	F.titleIn.value = wsRow ? wsRow.title : '';
+	F.htmlIn.value = wsRow ? wsRow.html : '';
+	F.msg.textContent = '';
+	F.delBtn.style.display = wsRow ? '' : 'none';
+	pop.hidden = false;
+	F.titleIn.focus();
+}
+
+function closeWidgetSheet() {
+	if (widgetSheetEl) widgetSheetEl.hidden = true;
+	wsRow = null;
+}
+
+async function saveWidgetSheet() {
+	const F = widgetSheetEl._f;
+	const body = { title: F.titleIn.value.trim(), html: F.htmlIn.value.trim() };
+	if (!body.title) { F.msg.textContent = 'Give the widget a title.'; return; }
+	if (!body.html) { F.msg.textContent = 'Paste the HTML / embed code first.'; return; }
+	F.saveBtn.disabled = true;
+	try {
+		const r = wsRow
+			? await meFetch('POST', '/api/me/widgets/' + wsRow.id + '/update', body)
+			: await meFetch('POST', '/api/me/widgets/create', body);
+		const d = await r.json().catch(() => ({}));
+		if (!r.ok) throw new Error(d.error || ('save failed (' + r.status + ')'));
+		closeWidgetSheet();
+		await refreshAfterLinkChange();
+	} catch (err) { F.msg.textContent = err.message; }
+	F.saveBtn.disabled = false;
+}
+
+async function deleteWidgetSheet() {
+	if (!wsRow) return;
+	const F = widgetSheetEl._f;
+	if (!confirm('Delete the widget “' + wsRow.title + '”?')) return;
+	try {
+		const r = await meFetch('POST', '/api/me/widgets/' + wsRow.id + '/delete', {});
+		if (!r.ok) { const d = await r.json().catch(() => ({})); throw new Error(d.error || ('delete failed (' + r.status + ')')); }
+		closeWidgetSheet();
+		await refreshAfterLinkChange();
+	} catch (err) { F.msg.textContent = err.message; }
+}
+
+// Delete from a card's ✕ button (no sheet open).
+async function deleteWidget(id) {
+	const w = (S.widgets || []).find(x => x.id === id);
+	if (!w) return;
+	if (!confirm('Delete the widget “' + w.title + '”?')) return;
+	try {
+		const r = await meFetch('POST', '/api/me/widgets/' + id + '/delete', {});
+		if (!r.ok) throw new Error('delete failed (' + r.status + ')');
+		await refreshAfterLinkChange();
+	} catch (err) { /* the card stays put; nothing to show the error on */ }
+}
+
+async function moveWidget(id, direction) {
+	try {
+		const r = await meFetch('POST', '/api/me/widgets/move', { id, direction });
+		if (!r.ok) throw new Error('move failed (' + r.status + ')');
+		await refreshAfterLinkChange();
+	} catch (err) { /* already at the edge, or a transient failure */ }
 }
 
 // Dock icons join in: in edit mode a tap opens the editor, and clicks
