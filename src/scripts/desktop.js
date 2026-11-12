@@ -547,6 +547,7 @@ function toggleDesktopEdit(force) {
 	if (!desktopEditing && dragState) endDrag(false);
 	if (!desktopEditing) closeLinkSheet();
 	renderDesktopIcons();
+	renderWidgets();
 }
 
 // In Edit Desktop mode, tapping a tile inside the All Apps window opens
