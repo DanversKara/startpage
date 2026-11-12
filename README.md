@@ -89,8 +89,20 @@ This edition adds a small **Rust** service (`server/`, binary
   sends them in `/api/state` when the viewer IS the owner, so a
   signed-out visitor or another user's profile never sees anyone's
   widgets, and they are never rendered on public/shared pages. Each
-  widget can be edited, deleted, or moved left/right from its card
-  header in Edit Desktop mode.
+  widget can be edited or deleted from its card header in Edit Desktop
+  mode.
+- **Widgets on the grid (v1.25.0):** widgets are no longer a strip
+  above the dock — each one is a tile on the desktop grid, sitting in
+  an empty spot like an app icon and never covering one. Drag a widget
+  in Edit Desktop mode to move it to any empty cells (the drop ghost
+  turns red where its span doesn't fit), or drag its ⤢ corner — or set
+  Width/Height in the editor — to resize it across several cells;
+  position and size are stored server-side, so they survive reloads.
+  New widgets land in the first free span of their size, and icons can
+  never be dropped on a widget's cells either. Widgets also gain a
+  Public checkbox: private widgets stay owner-only exactly as before,
+  while a public widget is shown to everyone, including signed-out
+  visitors.
 
 ## Security model — and its honest limits
 

@@ -195,7 +195,6 @@ function setupPinGate() {
 	if (S.pinRequired) { setupPinGate(); return; }
 	applyRotationAtBoot();
 	renderDesktopIcons();
-	renderWidgets();
 	renderDock();
 	renderAbout();
 	setupDockMagnification();

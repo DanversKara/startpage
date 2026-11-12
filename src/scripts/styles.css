@@ -1248,6 +1248,18 @@ body::after {
     /* No hover lift on touch; the JS press-scale still gives tap feedback. */
     .desktop-icon:hover { background: none; transform: none; }
     .desktop-icon:hover .icon-art { filter: var(--icon-shadow); }
+
+    /* Widgets flow as full-width rows in the touch grid, like the icons. */
+    .widget-tile {
+        position: static !important;
+        left: auto !important;
+        top: auto !important;
+        width: auto !important;
+        height: auto !important;
+        min-height: 120px;
+        grid-column: 1 / -1;
+    }
+    .widget-resize { display: none !important; }
 }
 
 /* Tablets inside the touch layout (769–1024px): four columns and a
@@ -1353,21 +1365,29 @@ body::after {
 .ls-note { font-size: 12px; color: rgba(235,235,245,.55); margin: 8px 0 0; line-height: 1.45; }
 .ls-title { margin: 0 0 4px; font-size: 16px; }
 .ls-field { margin-top: 12px; }
+.ls-check { display: flex; gap: 8px; align-items: center; margin-top: 14px; font: 13.5px system-ui, sans-serif; color: rgba(255,255,255,.85); cursor: pointer; }
+.ls-check input { width: 16px; height: 16px; accent-color: #2f6bff; flex: none; }
+.ls-size-row { display: flex; gap: 10px; }
+.ls-size-row .ls-field { flex: 1; min-width: 0; }
 .ls-field > label { display: block; font-size: 11px; font-weight: 600; letter-spacing: .08em; text-transform: uppercase; color: rgba(255,255,255,.55); margin-bottom: 5px; }
 .ls-input { width: 100%; box-sizing: border-box; border-radius: 10px; border: 1px solid rgba(255,255,255,.18); background: rgba(255,255,255,.06); color: #fff; padding: 9px 11px; font: 13.5px system-ui, sans-serif; }
-/* ── Widgets (owner-only HTML/script embeds, above the dock) ──── */
-.widgets-row { position: fixed; left: 0; right: 0; bottom: 118px; z-index: 90; display: flex; gap: 12px; align-items: stretch; overflow-x: auto; padding: 4px 16px 8px; scrollbar-width: thin; }
-.widgets-row[hidden] { display: none; }
-.widget-card { flex: 0 0 auto; width: min(380px, calc(100vw - 48px)); max-height: 300px; display: flex; flex-direction: column; background: linear-gradient(180deg, var(--w-20), var(--w-12)); backdrop-filter: var(--blur-dock); -webkit-backdrop-filter: var(--blur-dock); border: 1px solid var(--w-30); border-radius: 16px; box-shadow: 0 12px 40px var(--k-40); overflow: hidden; color: #f2f2f5; }
-.widget-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 8px 12px; border-bottom: 1px solid rgba(255,255,255,.1); font: 600 12.5px system-ui, sans-serif; color: rgba(255,255,255,.85); }
+/* ── Widgets (owner HTML/script embeds, as tiles on the desktop grid) ──── */
+.widget-tile { position: absolute; display: flex; flex-direction: column; background: linear-gradient(180deg, var(--w-20), var(--w-12)); backdrop-filter: var(--blur-dock); -webkit-backdrop-filter: var(--blur-dock); border: 1px solid var(--w-30); border-radius: 16px; box-shadow: 0 12px 40px var(--k-40); overflow: hidden; color: #f2f2f5; }
+.widget-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 8px 12px; border-bottom: 1px solid rgba(255,255,255,.1); font: 600 12.5px system-ui, sans-serif; color: rgba(255,255,255,.85); flex: none; }
 .widget-title { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .widget-controls { display: flex; gap: 4px; flex: none; }
 .widget-btn { background: rgba(255,255,255,.1); border: 1px solid rgba(255,255,255,.16); color: #fff; border-radius: 7px; padding: 3px 8px; font: 12px system-ui, sans-serif; cursor: pointer; }
 .widget-btn-del { color: #ffb4b4; }
+.widget-vis { flex: none; font: 600 10px system-ui, sans-serif; letter-spacing: .04em; padding: 2px 6px; border-radius: 6px; background: rgba(255,255,255,.12); color: rgba(255,255,255,.7); }
+.widget-vis.public { background: rgba(106,176,255,.28); color: #d6e9ff; }
 .widget-body { flex: 1; overflow: auto; padding: 10px 12px; font: 13px system-ui, sans-serif; }
-.widget-add { align-items: center; justify-content: center; gap: 6px; border: 2px dashed rgba(255,255,255,.35); background: transparent; box-shadow: none; cursor: pointer; color: rgba(255,255,255,.8); min-height: 96px; }
-.widget-add-plus { font-size: 26px; line-height: 1; font-weight: 300; }
-.widget-add-label { font: 13px system-ui, sans-serif; }
+.widget-resize { position: absolute; right: 5px; bottom: 5px; width: 26px; height: 26px; display: none; align-items: center; justify-content: center; cursor: nwse-resize; color: rgba(255,255,255,.8); background: rgba(255,255,255,.14); border: 1px solid rgba(255,255,255,.22); border-radius: 8px; z-index: 5; touch-action: none; }
+.desktop.editing .widget-resize { display: flex; }
+.desktop.editing .widget-tile { animation: jiggle 0.22s ease-in-out infinite; cursor: grab; touch-action: none; }
+.desktop.editing .widget-tile:nth-child(even) { animation-delay: 0.11s; }
+.widget-tile.dragging { animation: none !important; z-index: 60; cursor: grabbing; opacity: .92; }
+.widget-tile.resize-invalid { outline: 2px solid #ff6b5e; outline-offset: 2px; }
+.desktop-icon-ghost.invalid { border-color: #ff6b5e; background: rgba(255,107,94,.14); }
 .ls-textarea { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 12.5px; line-height: 1.5; min-height: 140px; resize: vertical; white-space: pre; }
 .ls-icon-row { display: flex; gap: 8px; align-items: center; }
 .ls-icon-row .ls-input { flex: 1; }

@@ -59,9 +59,15 @@ function renderDesktopIcons() {
 		});
 		grid.appendChild(a);
 	});
-	// In edit mode the owner gets a ＋ Add tile in the first free cell.
+	// Widgets are grid tiles too — same cells, never overlapping an
+	// icon. Their DOM is cached (renderGridWidgets), so a re-render
+	// moves the node instead of rebuilding it and re-running its
+	// <script>.
+	renderGridWidgets();
+	// In edit mode the owner gets ＋ Add tiles in the first free cells.
 	if (desktopEditing && S.csrf) {
-		const cell = nextFreeCell(occupiedCells());
+		const occupied = occupiedCells();
+		const cell = nextFreeCell(occupied);
 		const add = el('div', { class: 'desktop-icon add-tile', role: 'button', tabindex: '0', title: 'Add a link' },
 			el('div', { class: 'add-plus', text: '＋' }),
 			el('span', { class: 'desktop-icon-label', text: 'Add link' }),
@@ -73,14 +79,22 @@ function renderDesktopIcons() {
 		});
 		add.addEventListener('pointerup', e => { e.stopPropagation(); openLinkSheet(null, 'desktop'); });
 		grid.appendChild(add);
+		occupied.add(cell.col + ',' + cell.row);
+		const wcell = nextFreeCell(occupied);
+		const wadd = el('div', { class: 'desktop-icon add-tile', role: 'button', tabindex: '0', title: 'Add a widget' },
+			el('div', { class: 'add-plus', text: '＋' }),
+			el('span', { class: 'desktop-icon-label', text: 'Add widget' }),
+		);
+		Object.assign(wadd.style, {
+			position: 'absolute',
+			left: (GRID.ox + wcell.col * GRID.uw) + 'px',
+			top: (GRID.oy + wcell.row * GRID.uh) + 'px',
+		});
+		wadd.addEventListener('pointerup', e => { e.stopPropagation(); openWidgetSheet(null); });
+		grid.appendChild(wadd);
 	}
 }
 
-// ─────────────────────────────────────────────────────────────────────
-// Widgets — the signed-in owner's own HTML/script embeds, rendered in a
-// strip above the dock. The server only ever sends widgets when the
-// viewer IS the owner, so a public/profile page simply has none.
-// ─────────────────────────────────────────────────────────────────────
 function injectWidgetHtml(container, html) {
 	// innerHTML never runs <script> tags — and running them is the
 	// whole point of a widget embed. So after the static markup lands,
@@ -97,37 +111,91 @@ function injectWidgetHtml(container, html) {
 	});
 }
 
-function renderWidgets() {
-	const row = $('widgetsRow');
-	if (!row) return;
-	const widgets = S.widgets || [];
-	row.innerHTML = '';
-	// Nothing to show and nothing to add: keep the strip out of the way.
-	row.hidden = widgets.length === 0 && !(desktopEditing && S.csrf);
-	widgets.forEach(w => {
-		const head = el('div', { class: 'widget-head' },
-			el('span', { class: 'widget-title', text: w.title }),
-		);
-		if (desktopEditing && S.csrf) {
-			head.appendChild(el('span', { class: 'widget-controls' },
-				el('button', { class: 'widget-btn', type: 'button', text: '←', title: 'Move left', onclick: e => { e.stopPropagation(); moveWidget(w.id, 'up'); } }),
-				el('button', { class: 'widget-btn', type: 'button', text: '→', title: 'Move right', onclick: e => { e.stopPropagation(); moveWidget(w.id, 'down'); } }),
-				el('button', { class: 'widget-btn', type: 'button', text: 'Edit', title: 'Edit widget', onclick: e => { e.stopPropagation(); openWidgetSheet(w.id); } }),
-				el('button', { class: 'widget-btn widget-btn-del', type: 'button', text: '✕', title: 'Delete widget', onclick: e => { e.stopPropagation(); deleteWidget(w.id); } }),
-			));
-		}
-		const body = el('div', { class: 'widget-body' });
-		row.appendChild(el('div', { class: 'widget-card' }, head, body));
-		injectWidgetHtml(body, w.html);
+// ─────────────────────────────────────────────────────────────────────
+// Widgets — the owner's (and, when marked Public, everyone's) HTML /
+// script embeds, as tiles on the desktop grid. A widget spans whole
+// grid cells, sits in an empty spot like an icon, and is dragged and
+// resized in Edit Desktop mode. The server only ever sends a private
+// widget when the viewer IS its owner; public ones ride along for
+// every viewer.
+// ─────────────────────────────────────────────────────────────────────
+// Tiles are cached per widget id and re-appended on re-render, so the
+// node — and the <script> running inside it — survives icon moves,
+// edit toggles and state refreshes. Rebuilding the tile would re-run
+// the embed and reset live widgets (a call widget, say) on every
+// unrelated change.
+let widgetEls = new Map(); // widget id -> tile element
+let resizeState = null;    // active corner-drag resize, if any
+
+function makeWidgetEl(w) {
+	const tile = el('div', { class: 'widget-tile', data: { key: w.id }, role: 'group' });
+	const head = el('div', { class: 'widget-head' });
+	const body = el('div', { class: 'widget-body' });
+	const resize = el('div', { class: 'widget-resize', title: 'Drag to resize' }, el('span', { text: '⤢' }));
+	tile.append(head, body, resize);
+	tile._head = head;
+	tile._body = body;
+	tile._html = null;
+	// Corner resize (Edit Desktop only): stop the press so the grid's
+	// move-drag never starts from the handle.
+	resize.addEventListener('pointerdown', e => {
+		if (!desktopEditing) return;
+		e.stopPropagation();
+		e.preventDefault();
+		const cur = (S.widgets || []).find(x => x.id === tile.dataset.key);
+		if (!cur) return;
+		const span = widgetSpan(cur);
+		resizeState = { id: cur.id, tile, col: span.col, row: span.row, w: span.w, h: span.h, startW: span.w, startH: span.h };
 	});
-	// In edit mode the owner gets an ＋ Add widget card at the end.
+	return tile;
+}
+
+// Geometry + head for one widget tile. The body is only re-injected
+// when the HTML actually changed — see the cache note above.
+function syncWidgetTile(tile, w) {
+	const s = widgetSpan(w);
+	Object.assign(tile.style, {
+		position: 'absolute',
+		left: (GRID.ox + s.col * GRID.uw) + 'px',
+		top: (GRID.oy + s.row * GRID.uh) + 'px',
+		width: (s.w * GRID.uw - 6) + 'px',
+		height: (s.h * GRID.uh - 6) + 'px',
+	});
+	const head = tile._head;
+	head.innerHTML = '';
+	head.appendChild(el('span', { class: 'widget-title', text: w.title }));
 	if (desktopEditing && S.csrf) {
-		const add = el('div', { class: 'widget-card widget-add', role: 'button', tabindex: '0', title: 'Add a widget' },
-			el('div', { class: 'widget-add-plus', text: '＋' }),
-			el('span', { class: 'widget-add-label', text: 'Add widget' }),
-		);
-		add.addEventListener('pointerup', e => { e.stopPropagation(); openWidgetSheet(null); });
-		row.appendChild(add);
+		head.appendChild(el('span', { class: 'widget-vis' + (w.is_public ? ' public' : ''), text: w.is_public ? 'Public' : 'Private' }));
+		const ctrls = el('span', { class: 'widget-controls' });
+		const editBtn = el('button', { class: 'widget-btn', type: 'button', text: 'Edit', title: 'Edit widget' });
+		const delBtn = el('button', { class: 'widget-btn widget-btn-del', type: 'button', text: '✕', title: 'Delete widget' });
+		// pointerdown stops the move-drag starting from a control;
+		// pointerup fires the action (the grid's capture click handler
+		// eats plain clicks while editing).
+		[editBtn, delBtn].forEach(b => b.addEventListener('pointerdown', e => e.stopPropagation()));
+		editBtn.addEventListener('pointerup', e => { e.stopPropagation(); openWidgetSheet(w.id); });
+		delBtn.addEventListener('pointerup', e => { e.stopPropagation(); deleteWidget(w.id); });
+		ctrls.append(editBtn, delBtn);
+		head.appendChild(ctrls);
+	}
+	if (tile._html !== w.html) {
+		injectWidgetHtml(tile._body, w.html);
+		tile._html = w.html;
+	}
+}
+
+function renderGridWidgets() {
+	const grid = $('desktopGrid');
+	const seen = new Set();
+	(S.widgets || []).forEach(w => {
+		seen.add(w.id);
+		let tile = widgetEls.get(w.id);
+		if (!tile) { tile = makeWidgetEl(w); widgetEls.set(w.id, tile); }
+		syncWidgetTile(tile, w);
+		grid.appendChild(tile);
+	});
+	for (const [id, tile] of widgetEls) {
+		if (!seen.has(id)) { tile.remove(); widgetEls.delete(id); }
 	}
 }
 
@@ -547,7 +615,6 @@ function toggleDesktopEdit(force) {
 	if (!desktopEditing && dragState) endDrag(false);
 	if (!desktopEditing) closeLinkSheet();
 	renderDesktopIcons();
-	renderWidgets();
 }
 
 // In Edit Desktop mode, tapping a tile inside the All Apps window opens
@@ -581,18 +648,24 @@ function setupDesktopEditing() {
 	}, true);
 	grid.addEventListener('pointerdown', e => {
 		if (!desktopEditing || e.button > 0) return;
-		const iconEl = e.target.closest('.desktop-icon');
-		if (!iconEl) return;
-		const item = S.desktopIcons.find(i => i.id === iconEl.dataset.key);
+		const tileEl = e.target.closest('.desktop-icon, .widget-tile');
+		if (!tileEl) return;
+		const isWidget = tileEl.classList.contains('widget-tile');
+		const item = isWidget
+			? (S.widgets || []).find(w => w.id === tileEl.dataset.key)
+			: S.desktopIcons.find(i => i.id === tileEl.dataset.key);
 		if (!item) return;
 		e.preventDefault();
 		const gr = grid.getBoundingClientRect();
+		const span = isWidget ? widgetSpan(item) : { w: 1, h: 1 };
 		dragState = {
-			el: iconEl, item,
+			kind: isWidget ? 'widget' : 'link',
+			el: tileEl, item,
 			startCol: item.col, startRow: item.row,
-			grabDX: e.clientX - gr.left - iconEl.offsetLeft,
-			grabDY: e.clientY - gr.top - iconEl.offsetTop,
-			moved: false, ghost: null, cell: null,
+			w: span.w, h: span.h,
+			grabDX: e.clientX - gr.left - tileEl.offsetLeft,
+			grabDY: e.clientY - gr.top - tileEl.offsetTop,
+			moved: false, ghost: null, cell: null, dropOk: true,
 			folderIntent: false, hoverCell: null, hoverSince: 0, intentEl: null, intentTimer: null,
 		};
 	});
@@ -608,6 +681,10 @@ function setupDesktopEditing() {
 			dragState.moved = true;
 			dragState.el.classList.add('dragging');
 			dragState.ghost = el('div', { class: 'desktop-icon-ghost' });
+			if (dragState.kind === 'widget') {
+				dragState.ghost.style.width = (dragState.w * GRID.uw - 6) + 'px';
+				dragState.ghost.style.height = (dragState.h * GRID.uh - 6) + 'px';
+			}
 			grid.appendChild(dragState.ghost);
 		}
 		dragState.el.style.left = left + 'px';
@@ -616,9 +693,51 @@ function setupDesktopEditing() {
 		dragState.cell = cell;
 		dragState.ghost.style.left = (GRID.ox + cell.col * GRID.uw) + 'px';
 		dragState.ghost.style.top = (GRID.oy + cell.row * GRID.uh) + 'px';
-		updateDragIntent(cell);
+		if (dragState.kind === 'widget') {
+			// A widget only lands where its whole span fits in empty
+			// cells; the ghost turns red where it doesn't.
+			dragState.dropOk = spanFree(cell.col, cell.row, dragState.w, dragState.h, dragState.item.id);
+			dragState.ghost.classList.toggle('invalid', !dragState.dropOk);
+		} else {
+			dragState.ghost.classList.toggle('invalid', !!widgetCoveringCell(cell.col, cell.row));
+			updateDragIntent(cell);
+		}
 	});
 	window.addEventListener('pointerup', e => { if (dragState) endDrag(true, e.clientX, e.clientY); });
+	// Corner-drag resize for widget tiles (Edit Desktop only). The
+	// handle's own pointerdown stops the move-drag from starting, so
+	// these two gestures never run at once.
+	window.addEventListener('pointermove', e => {
+		if (!resizeState) return;
+		const gr = grid.getBoundingClientRect();
+		const tileLeft = GRID.ox + resizeState.col * GRID.uw;
+		const tileTop = GRID.oy + resizeState.row * GRID.uh;
+		const px = e.clientX - gr.left, py = e.clientY - gr.top;
+		const maxCols = Math.max(1, Math.floor((window.innerWidth - GRID.ox) / GRID.uw));
+		const w = Math.max(1, Math.min(6, maxCols - resizeState.col, Math.round((px - tileLeft) / GRID.uw)));
+		const h = Math.max(1, Math.min(6, Math.round((py - tileTop) / GRID.uh)));
+		resizeState.w = w; resizeState.h = h;
+		resizeState.tile.style.width = (w * GRID.uw - 6) + 'px';
+		resizeState.tile.style.height = (h * GRID.uh - 6) + 'px';
+		resizeState.tile.classList.toggle('resize-invalid', !spanFree(resizeState.col, resizeState.row, w, h, resizeState.id));
+	});
+	window.addEventListener('pointerup', async () => {
+		if (!resizeState) return;
+		const r = resizeState; resizeState = null;
+		r.tile.classList.remove('resize-invalid');
+		const changed = r.w !== r.startW || r.h !== r.startH;
+		if (changed && spanFree(r.col, r.row, r.w, r.h, r.id)) {
+			const widget = (S.widgets || []).find(x => x.id === r.id);
+			if (widget) {
+				try {
+					const resp = await meFetch('POST', '/api/me/widgets/' + r.id + '/update', { title: widget.title, html: widget.html, w: r.w, h: r.h });
+					if (!resp.ok) throw new Error('resize rejected');
+					widget.w = r.w; widget.h = r.h;
+				} catch (_) { /* snap back below */ }
+			}
+		}
+		renderDesktopIcons();
+	});
 	document.addEventListener('keydown', e => {
 		if (e.key !== 'Escape') return;
 		if (openFolderId) { closeFolder(); return; }
@@ -705,12 +824,28 @@ async function endDrag(commit, px, py) {
 	d.el.classList.remove('dragging');
 	if (!commit || !d.moved || !d.cell) {
 		renderDesktopIcons();
-		// A tap (press without a drag) in edit mode opens the link editor.
-		if (commit && !d.moved && desktopEditing) openLinkSheet(d.item.id);
+		// A tap (press without a drag) in edit mode opens the editor.
+		if (commit && !d.moved && desktopEditing) {
+			if (d.kind === 'widget') openWidgetSheet(d.item.id);
+			else openLinkSheet(d.item.id);
+		}
 		return;
 	}
 	const { col, row } = d.cell;
 	if (col === d.startCol && row === d.startRow) { renderDesktopIcons(); return; }
+	// Widget drops land only on a fully empty span — never on an icon
+	// or another widget. Anything else snaps the tile back.
+	if (d.kind === 'widget') {
+		if (!d.dropOk || !spanFree(col, row, d.w, d.h, d.item.id)) { renderDesktopIcons(); return; }
+		try {
+			const r = await meFetch('POST', '/api/me/widgets/move', { id: d.item.id, col, row });
+			if (!r.ok) throw new Error('move rejected');
+			d.item.col = col; d.item.row = row;
+		} catch (_) { /* the re-render below snaps back */ }
+		renderDesktopIcons();
+		return;
+	}
+	const dropOnWidget = !!widgetCoveringCell(col, row);
 	let occupant = S.desktopIcons.find(i => i !== d.item && i.col === col && i.row === row);
 	if (px != null && !d.item.folder) {
 		const probed = probeDropTarget(d, px, py);
@@ -729,6 +864,7 @@ async function endDrag(commit, px, py) {
 	}
 	// Held over an icon: bundle the two into a new folder at that cell.
 	if (occupant && d.folderIntent && !d.item.folder) {
+		if (dropOnWidget) { renderDesktopIcons(); return; }
 		try {
 			const r = await fetch('/api/links/folder', {
 				method: 'POST',
@@ -740,6 +876,8 @@ async function endDrag(commit, px, py) {
 		refreshDesktop();
 		return;
 	}
+	// The icon itself lands on the grid — never on a widget's cells.
+	if (dropOnWidget) { renderDesktopIcons(); return; }
 	try {
 		await postMove({
 			id: d.item.id, col, row,
@@ -1133,7 +1271,6 @@ function closeLinkSheet() {
 async function refreshAfterLinkChange() {
 	await loadState();
 	renderDesktopIcons();
-	renderWidgets();
 	renderDock();
 	if (openFolderId) {
 		const still = S.desktopIcons.find(i => i.id === openFolderId && i.folder);
@@ -1208,20 +1345,27 @@ function ensureWidgetSheet() {
 	const title = el('h3', { class: 'ls-title', text: 'Add widget' });
 	const titleIn = el('input', { class: 'ls-input', maxlength: 120, placeholder: 'Widget title' });
 	const htmlIn = el('textarea', { class: 'ls-input ls-textarea', placeholder: '<script src="https://pbx.ownpbx.org/widget.js" data-widget="w_…" async></script>', spellcheck: false, rows: 8 });
-	const note = el('p', { class: 'ls-note', text: 'Paste your own HTML / embed code — it runs as-is on your desktop, including <script> tags. Only you ever see it.' });
+	const pubWrap = el('label', { class: 'ls-check' },
+		el('input', { type: 'checkbox' }),
+		el('span', { text: 'Public — show to everyone' }));
+	const pubIn = pubWrap.querySelector('input');
+	const wIn = el('input', { class: 'ls-input', type: 'number', min: 1, max: 6, value: 3 });
+	const hIn = el('input', { class: 'ls-input', type: 'number', min: 1, max: 6, value: 2 });
+	const sizeRow = el('div', { class: 'ls-size-row' }, field('Width (cells)', wIn), field('Height (cells)', hIn));
+	const note = el('p', { class: 'ls-note', text: 'Paste your own HTML / embed code — it runs as-is on your desktop, including <script> tags. Private widgets are only ever visible to you; tick Public to show the widget to everyone, including signed-out visitors. Drag the ⤢ corner in Edit Desktop mode to resize it.' });
 	const msg = el('p', { class: 'report-msg ls-msg' });
 	const delBtn = el('button', { class: 'report-btn ls-delete', type: 'button', text: 'Delete' });
 	const cancelBtn = el('button', { class: 'report-btn', type: 'button', text: 'Cancel' });
 	const saveBtn = el('button', { class: 'report-btn primary', type: 'button', text: 'Save' });
 	const card = el('div', { class: 'link-sheet-card' },
-		title, field('Title', titleIn), field('HTML / embed code', htmlIn), note, msg,
+		title, field('Title', titleIn), field('HTML / embed code', htmlIn), pubWrap, sizeRow, note, msg,
 		el('div', { class: 'report-actions ls-actions' }, delBtn, el('span', { class: 'ls-spacer' }), cancelBtn, saveBtn),
 	);
 	const pop = el('div', { class: 'link-sheet', hidden: true }, card);
 	pop.addEventListener('pointerdown', e => { if (e.target === pop) closeWidgetSheet(); });
 	document.body.appendChild(pop);
 	widgetSheetEl = pop;
-	pop._f = { title, titleIn, htmlIn, msg, delBtn, saveBtn };
+	pop._f = { title, titleIn, htmlIn, pubIn, wIn, hIn, msg, delBtn, saveBtn };
 	cancelBtn.addEventListener('click', () => closeWidgetSheet());
 	saveBtn.addEventListener('click', () => saveWidgetSheet());
 	delBtn.addEventListener('click', () => deleteWidgetSheet());
@@ -1235,6 +1379,9 @@ function openWidgetSheet(id) {
 	F.title.textContent = wsRow ? 'Edit widget' : 'Add widget';
 	F.titleIn.value = wsRow ? wsRow.title : '';
 	F.htmlIn.value = wsRow ? wsRow.html : '';
+	F.pubIn.checked = !!(wsRow && wsRow.is_public);
+	F.wIn.value = wsRow ? wsRow.w : 3;
+	F.hIn.value = wsRow ? wsRow.h : 2;
 	F.msg.textContent = '';
 	F.delBtn.style.display = wsRow ? '' : 'none';
 	pop.hidden = false;
@@ -1248,7 +1395,13 @@ function closeWidgetSheet() {
 
 async function saveWidgetSheet() {
 	const F = widgetSheetEl._f;
-	const body = { title: F.titleIn.value.trim(), html: F.htmlIn.value.trim() };
+	const body = {
+		title: F.titleIn.value.trim(),
+		html: F.htmlIn.value.trim(),
+		is_public: F.pubIn.checked,
+		w: Math.max(1, Math.min(6, parseInt(F.wIn.value, 10) || 3)),
+		h: Math.max(1, Math.min(6, parseInt(F.hIn.value, 10) || 2)),
+	};
 	if (!body.title) { F.msg.textContent = 'Give the widget a title.'; return; }
 	if (!body.html) { F.msg.textContent = 'Paste the HTML / embed code first.'; return; }
 	F.saveBtn.disabled = true;
@@ -1286,14 +1439,6 @@ async function deleteWidget(id) {
 		if (!r.ok) throw new Error('delete failed (' + r.status + ')');
 		await refreshAfterLinkChange();
 	} catch (err) { /* the card stays put; nothing to show the error on */ }
-}
-
-async function moveWidget(id, direction) {
-	try {
-		const r = await meFetch('POST', '/api/me/widgets/move', { id, direction });
-		if (!r.ok) throw new Error('move failed (' + r.status + ')');
-		await refreshAfterLinkChange();
-	} catch (err) { /* already at the edge, or a transient failure */ }
 }
 
 // Dock icons join in: in edit mode a tap opens the editor, and clicks

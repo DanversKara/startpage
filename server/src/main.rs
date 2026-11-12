@@ -643,7 +643,10 @@ fn links_of(db: &Connection, owner: &str) -> Vec<LinkRow> {
     }
 }
 
-/// A user's own HTML/script embed, rendered only on their own desktop.
+/// A user's own HTML/script embed, rendered only on their own desktop
+/// (or to everyone, when marked public). col/row/w/h place it on the
+/// desktop grid like an icon tile; a widget with no cell yet (created
+/// before grid placement existed) is placed on first load.
 struct WidgetRow {
     id: String,
     owner_id: String,
@@ -651,11 +654,16 @@ struct WidgetRow {
     html: String,
     sort: i64,
     created_at: i64,
+    is_public: bool,
+    col: Option<i64>,
+    row: Option<i64>,
+    w: i64,
+    h: i64,
 }
 
 fn widgets_of(db: &Connection, owner: &str) -> Vec<WidgetRow> {
     let mut stmt = match db.prepare(
-        "SELECT id, owner_id, title, html, sort, created_at FROM widgets WHERE owner_id = ?1 ORDER BY sort, created_at",
+        "SELECT id, owner_id, title, html, sort, created_at, is_public, col, row, w, h FROM widgets WHERE owner_id = ?1 ORDER BY sort, created_at",
     ) {
         Ok(s) => s,
         Err(_) => return Vec::new(),
@@ -668,6 +676,11 @@ fn widgets_of(db: &Connection, owner: &str) -> Vec<WidgetRow> {
             html: r.get(3)?,
             sort: r.get(4)?,
             created_at: r.get(5)?,
+            is_public: r.get::<_, i64>(6)? != 0,
+            col: r.get(7)?,
+            row: r.get(8)?,
+            w: r.get(9)?,
+            h: r.get(10)?,
         })
     });
     match mapped {
@@ -678,7 +691,7 @@ fn widgets_of(db: &Connection, owner: &str) -> Vec<WidgetRow> {
 
 fn widget_by_id(db: &Connection, id: &str) -> Option<WidgetRow> {
     db.query_row(
-        "SELECT id, owner_id, title, html, sort, created_at FROM widgets WHERE id = ?1",
+        "SELECT id, owner_id, title, html, sort, created_at, is_public, col, row, w, h FROM widgets WHERE id = ?1",
         params![id],
         |r| {
             Ok(WidgetRow {
@@ -688,10 +701,110 @@ fn widget_by_id(db: &Connection, id: &str) -> Option<WidgetRow> {
                 html: r.get(3)?,
                 sort: r.get(4)?,
                 created_at: r.get(5)?,
+                is_public: r.get::<_, i64>(6)? != 0,
+                col: r.get(7)?,
+                row: r.get(8)?,
+                w: r.get(9)?,
+                h: r.get(10)?,
             })
         },
     )
     .ok()
+}
+
+/// Cells a widget span covers, from its stored size (at least 1x1).
+/// A widget with no grid cell yet covers nothing.
+fn widget_span_cells(w: &WidgetRow) -> Vec<(i64, i64)> {
+    match (w.col, w.row) {
+        (Some(c), Some(r)) => {
+            let mut cells = Vec::new();
+            for rr in r..r + w.h.max(1) {
+                for cc in c..c + w.w.max(1) {
+                    cells.push((cc, rr));
+                }
+            }
+            cells
+        }
+        _ => Vec::new(),
+    }
+}
+
+/// Every cell taken on an owner's desktop: top-level desktop icons
+/// plus the spans of their widgets (optionally excluding one widget,
+/// e.g. the one being moved — its old cells free up as it moves).
+fn desktop_taken_cells(db: &Connection, owner: &str, exclude_widget: Option<&str>) -> std::collections::HashSet<(i64, i64)> {
+    let mut taken = std::collections::HashSet::new();
+    if let Ok(mut stmt) = db.prepare(
+        "SELECT col, row FROM links WHERE owner_id = ?1 AND section = 'desktop' AND folder_id IS NULL AND col IS NOT NULL AND row IS NOT NULL",
+    ) {
+        if let Ok(rows) = stmt.query_map(params![owner], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?))) {
+            for c in rows.flatten() {
+                taken.insert(c);
+            }
+        }
+    }
+    for w in widgets_of(db, owner) {
+        if Some(w.id.as_str()) == exclude_widget {
+            continue;
+        }
+        for c in widget_span_cells(&w) {
+            taken.insert(c);
+        }
+    }
+    taken
+}
+
+/// Is a w-by-h span at (col, row) entirely free on the owner's desktop?
+fn span_free(db: &Connection, owner: &str, col: i64, row: i64, w: i64, h: i64, exclude_widget: Option<&str>) -> bool {
+    let w = w.max(1);
+    let h = h.max(1);
+    if col < 0 || row < 0 || col + w > 65 {
+        return false;
+    }
+    let taken = desktop_taken_cells(db, owner, exclude_widget);
+    for r in row..row + h {
+        for c in col..col + w {
+            if taken.contains(&(c, r)) {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+/// First top-left cell where a w-by-h widget fits on the owner's
+/// desktop, scanning row-major like the icon placer (and capped at
+/// the same 12 columns, so auto-placement stays on a normal screen).
+/// Falls back to (0, 0) if the grid is full — the owner can still
+/// drag the widget somewhere free.
+fn first_free_span(db: &Connection, owner: &str, w: i64, h: i64, exclude_widget: Option<&str>) -> (i64, i64) {
+    let w = w.clamp(1, 6);
+    let h = h.clamp(1, 6);
+    let taken = desktop_taken_cells(db, owner, exclude_widget);
+    for row in 0..100i64 {
+        for col in 0..=(12 - w) {
+            let mut fits = true;
+            'scan: for r in row..row + h {
+                for c in col..col + w {
+                    if taken.contains(&(c, r)) {
+                        fits = false;
+                        break 'scan;
+                    }
+                }
+            }
+            if fits {
+                return (col, row);
+            }
+        }
+    }
+    (0, 0)
+}
+
+/// Does any of the owner's widgets cover one grid cell?
+fn widget_covers_cell(db: &Connection, owner: &str, col: i64, row: i64) -> bool {
+    widgets_of(db, owner)
+        .iter()
+        .any(|w| widget_span_cells(w).contains(&(col, row)))
 }
 
 /// Whose link set a page view shows: the signed-in user's own set, otherwise
@@ -753,12 +866,13 @@ async fn api_state(State(st): State<Shared>, headers: HeaderMap) -> Response {
             "pin_required": true, "pin_len": pin_len, "widgets": []
         }));
     }
-    // Widgets are the signed-in owner's own embeds, and only theirs:
-    // they ride api_state solely when the viewer IS the owner being
-    // viewed. A signed-out visitor on the public page — or a visitor
-    // on someone else's profile — never sees anyone's widgets, so the
-    // widget HTML (which may contain <script>) is never shipped to a
-    // page it doesn't belong on.
+    // Widgets are the owner's embeds: private ones ride api_state
+    // solely when the viewer IS the owner being viewed. A signed-out
+    // visitor on the public page — or a visitor on someone else's
+    // profile — never sees anyone's private widgets, so that HTML
+    // (which may contain <script>) is never shipped to a page it
+    // doesn't belong on. Widgets the owner marked Public are the
+    // exception: showing them is the owner's explicit choice.
     let is_owner = session_from_headers(&st, &headers)
         .map(|s| owner.as_deref() == Some(s.user.id.as_str()))
         .unwrap_or(false);
@@ -850,14 +964,15 @@ async fn api_state(State(st): State<Shared>, headers: HeaderMap) -> Response {
                 }
             }
         }
-        // The owner's own widgets — only when the viewer IS this owner
-        // (see is_owner above). Public/profile visitors get none.
-        if is_owner {
-            widgets = widgets_of(&db, &owner)
-                .into_iter()
-                .map(|w| serde_json::json!({ "id": w.id, "title": w.title, "html": w.html, "sort": w.sort }))
-                .collect();
-        }
+        // Widgets ride along when they are public, or when the viewer
+        // IS this owner. A private widget's HTML is never shipped to
+        // anyone but its owner; a public one is the owner's explicit
+        // choice to show it, so signed-out visitors get those too.
+        widgets = widgets_of(&db, &owner)
+            .into_iter()
+            .filter(|w| w.is_public || is_owner)
+            .map(|w| widget_json(&w))
+            .collect();
         if let Some(admin) = admin_user(&db) {
             for l in links_of(&db, &admin.id).iter().filter(|l| l.section == "about") {
                 let entry = serde_json::json!({ "id": l.id, "label": l.label, "icon": l.icon, "icon_bg": l.icon_bg });
@@ -991,6 +1106,10 @@ async fn api_links_move(State(st): State<Shared>, headers: HeaderMap, Json(input
         }
     }
     let old_folder = link.folder_id.clone();
+    // Never park an icon on a cell a widget spans.
+    if input.folder_id.is_none() && widget_covers_cell(&db, &sess.user.id, col, row) {
+        return json_response(StatusCode::BAD_REQUEST, serde_json::json!({ "error": "that cell is taken by a widget" }));
+    }
     // Swap: prefer the occupant the client saw at the target cell (its model
     // includes render-assigned positions the DB may not have yet); fall back
     // to whoever the DB has parked there.
@@ -1052,6 +1171,9 @@ async fn api_links_folder(State(st): State<Shared>, headers: HeaderMap, Json(inp
     }
     let col = input.col.clamp(0, 64);
     let row = input.row.clamp(0, 200);
+    if widget_covers_cell(&db, &sess.user.id, col, row) {
+        return json_response(StatusCode::BAD_REQUEST, serde_json::json!({ "error": "that cell is taken by a widget" }));
+    }
     let fid = insert_link(&db, &sess.user.id, "folder", "Folder", None, "src/icons/globe.svg", "desktop", Some(col), Some(row), 0, None);
     let _ = db.execute("UPDATE links SET folder_id = ?1 WHERE id IN (?2, ?3)", params![fid, input.a, input.b]);
     json_response(StatusCode::OK, serde_json::json!({ "ok": true, "folder_id": fid }))
@@ -2638,7 +2760,7 @@ async fn me_links(State(st): State<Shared>, headers: HeaderMap) -> Response {
 // admin uses these too — on their own desktop; the panel remains
 // the cross-account tool.
 fn next_free_cell(db: &Connection, owner: &str) -> (i64, i64) {
-    let taken: std::collections::HashSet<(i64, i64)> = {
+    let mut taken: std::collections::HashSet<(i64, i64)> = {
         let mut stmt = match db.prepare(
             "SELECT col, row FROM links WHERE owner_id = ?1 AND section = 'desktop' AND folder_id IS NULL AND col IS NOT NULL AND row IS NOT NULL",
         ) {
@@ -2648,6 +2770,12 @@ fn next_free_cell(db: &Connection, owner: &str) -> (i64, i64) {
         let m = stmt.query_map(params![owner], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)));
         match m { Ok(q) => q.filter_map(|x| x.ok()).collect(), Err(_) => std::collections::HashSet::new() }
     };
+    // Widgets' spans are taken too — a new link must never land on one.
+    for w in widgets_of(db, owner) {
+        for c in widget_span_cells(&w) {
+            taken.insert(c);
+        }
+    }
     for row in 0..1000i64 {
         for col in 0..12i64 {
             if !taken.contains(&(col, row)) {
@@ -2845,12 +2973,19 @@ async fn me_links_delete(State(st): State<Shared>, headers: HeaderMap, Path(id):
 struct WidgetInput {
     title: String,
     html: String,
+    // Omitted on create/update means "keep the current value"
+    // (create defaults: private, 3 wide x 2 tall).
+    is_public: Option<bool>,
+    w: Option<i64>,
+    h: Option<i64>,
 }
 
 #[derive(Deserialize)]
 struct WidgetMoveInput {
     id: String,
-    direction: String, // "up" | "down"
+    direction: Option<String>, // "up" | "down" (legacy strip order)
+    col: Option<i64>,          // grid drop: target cell
+    row: Option<i64>,
 }
 
 /// A widget is a title plus the owner's own HTML (an embed snippet).
@@ -2877,7 +3012,7 @@ fn validate_widget(title: &str, html: &str) -> Result<(String, String), String> 
 }
 
 fn widget_json(w: &WidgetRow) -> serde_json::Value {
-    serde_json::json!({ "id": w.id, "title": w.title, "html": w.html, "sort": w.sort, "created_at": w.created_at })
+    serde_json::json!({ "id": w.id, "title": w.title, "html": w.html, "sort": w.sort, "created_at": w.created_at, "is_public": w.is_public, "col": w.col, "row": w.row, "w": w.w, "h": w.h })
 }
 
 async fn me_widgets(State(st): State<Shared>, headers: HeaderMap) -> Response {
@@ -2907,10 +3042,16 @@ async fn me_widgets_create(State(st): State<Shared>, headers: HeaderMap, Json(in
         let sort: i64 = db
             .query_row("SELECT COALESCE(MAX(sort), -1) + 1 FROM widgets WHERE owner_id = ?1", params![sess.user.id], |r| r.get(0))
             .unwrap_or(0);
+        // New widgets land in the first free span of their size, so
+        // they never cover an app icon.
+        let w = input.w.unwrap_or(3).clamp(1, 6);
+        let h = input.h.unwrap_or(2).clamp(1, 6);
+        let (col, row) = first_free_span(&db, &sess.user.id, w, h, None);
+        let is_public = input.is_public.unwrap_or(false);
         let id = random_id();
         let _ = db.execute(
-            "INSERT INTO widgets(id, owner_id, title, html, sort, created_at) VALUES(?1, ?2, ?3, ?4, ?5, ?6)",
-            params![id, sess.user.id, title, html, sort, now_secs()],
+            "INSERT INTO widgets(id, owner_id, title, html, sort, created_at, is_public, col, row, w, h) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+            params![id, sess.user.id, title, html, sort, now_secs(), is_public as i64, col, row, w, h],
         );
         id
     };
@@ -2943,6 +3084,23 @@ async fn me_widgets_update(State(st): State<Shared>, headers: HeaderMap, Path(id
             return admin_json(StatusCode::NOT_FOUND, serde_json::json!({ "error": "no such widget" }));
         }
         let _ = db.execute("UPDATE widgets SET title = ?1, html = ?2 WHERE id = ?3", params![title, html, id]);
+        if let Some(p) = input.is_public {
+            let _ = db.execute("UPDATE widgets SET is_public = ?1 WHERE id = ?2", params![p as i64, id]);
+        }
+        // Resize: the new span has to fit where the widget sits (or
+        // take the first free span if the widget was never placed).
+        if input.w.is_some() || input.h.is_some() {
+            let nw = input.w.unwrap_or(existing.w).clamp(1, 6);
+            let nh = input.h.unwrap_or(existing.h).clamp(1, 6);
+            let (col, row) = match (existing.col, existing.row) {
+                (Some(c), Some(r)) => (c, r),
+                _ => first_free_span(&db, &sess.user.id, nw, nh, Some(&id)),
+            };
+            if !span_free(&db, &sess.user.id, col, row, nw, nh, Some(&id)) {
+                return admin_json(StatusCode::BAD_REQUEST, serde_json::json!({ "error": "that size doesn't fit here — move the widget somewhere with room first" }));
+            }
+            let _ = db.execute("UPDATE widgets SET col = ?1, row = ?2, w = ?3, h = ?4 WHERE id = ?5", params![col, row, nw, nh, id]);
+        }
     }
     let db = st.db.lock().unwrap();
     match widget_by_id(&db, &id) {
@@ -2987,14 +3145,26 @@ async fn me_widgets_move(State(st): State<Shared>, headers: HeaderMap, Json(inpu
     if existing.owner_id != sess.user.id {
         return admin_json(StatusCode::NOT_FOUND, serde_json::json!({ "error": "no such widget" }));
     }
+    // Grid move: drop the widget at a cell — only where its whole span
+    // fits in empty cells, so it can never cover an app icon.
+    if let (Some(col), Some(row)) = (input.col, input.row) {
+        let col = col.clamp(0, 64);
+        let row = row.clamp(0, 200);
+        if !span_free(&db, &sess.user.id, col, row, existing.w, existing.h, Some(&existing.id)) {
+            return admin_json(StatusCode::BAD_REQUEST, serde_json::json!({ "error": "that spot is taken" }));
+        }
+        let _ = db.execute("UPDATE widgets SET col = ?1, row = ?2 WHERE id = ?3", params![col, row, input.id]);
+        return admin_json(StatusCode::OK, serde_json::json!({ "ok": true }));
+    }
+    // Legacy strip order (up/down swap) — kept for older clients.
     let rows = widgets_of(&db, &sess.user.id);
     let pos = match rows.iter().position(|w| w.id == input.id) {
         Some(p) => p,
         None => return admin_json(StatusCode::NOT_FOUND, serde_json::json!({ "error": "no such widget" })),
     };
-    let other = match input.direction.as_str() {
-        "up" => pos.checked_sub(1).and_then(|i| rows.get(i)),
-        "down" => rows.get(pos + 1),
+    let other = match input.direction.as_deref() {
+        Some("up") => pos.checked_sub(1).and_then(|i| rows.get(i)),
+        Some("down") => rows.get(pos + 1),
         _ => return admin_json(StatusCode::BAD_REQUEST, serde_json::json!({ "error": "direction must be up or down" })),
     };
     // Already at the edge — nothing to swap.
@@ -5895,6 +6065,45 @@ fn init_db(data_dir: &FsPath) -> Connection {
             .collect();
         if !cols.iter().any(|c| c == "source") {
             db.execute("ALTER TABLE reports ADD COLUMN source TEXT", []).expect("add reports.source column");
+        }
+    }
+    // Widgets on the grid (v1.25.0): visibility (public vs private),
+    // grid cell, and span in cells. Guarded ALTERs — idempotent, safe
+    // on every boot, including databases created before these existed.
+    // Widgets created before placement get a cell here: the first free
+    // span of their size on their owner's desktop, so the one live
+    // widget doesn't suddenly sit at (0, 0) on top of an icon.
+    {
+        let mut stmt = db.prepare("PRAGMA table_info(widgets)").expect("pragma table_info widgets");
+        let cols: Vec<String> = stmt
+            .query_map([], |r| r.get::<_, String>(1))
+            .expect("pragma rows")
+            .filter_map(|c| c.ok())
+            .collect();
+        drop(stmt);
+        for (col, ddl) in [
+            ("is_public", "ALTER TABLE widgets ADD COLUMN is_public INTEGER NOT NULL DEFAULT 0"),
+            ("col", "ALTER TABLE widgets ADD COLUMN col INTEGER"),
+            ("row", "ALTER TABLE widgets ADD COLUMN row INTEGER"),
+            ("w", "ALTER TABLE widgets ADD COLUMN w INTEGER NOT NULL DEFAULT 3"),
+            ("h", "ALTER TABLE widgets ADD COLUMN h INTEGER NOT NULL DEFAULT 2"),
+        ] {
+            if !cols.iter().any(|c| c == col) {
+                db.execute(ddl, []).expect("add widgets column");
+            }
+        }
+        let mut stmt = db
+            .prepare("SELECT id, owner_id, w, h FROM widgets WHERE col IS NULL OR row IS NULL ORDER BY owner_id, sort, created_at")
+            .expect("widgets backfill select");
+        let pending: Vec<(String, String, i64, i64)> = stmt
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
+            .expect("widgets backfill rows")
+            .filter_map(|x| x.ok())
+            .collect();
+        drop(stmt);
+        for (id, owner, w, h) in pending {
+            let (col, row) = first_free_span(&db, &owner, w, h, Some(&id));
+            let _ = db.execute("UPDATE widgets SET col = ?1, row = ?2 WHERE id = ?3", params![col, row, id]);
         }
     }
     // Desktop folders: links.folder_id points at the folder's own link row

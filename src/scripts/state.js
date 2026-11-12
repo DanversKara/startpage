@@ -26,7 +26,71 @@ function nextFreeCell(occupied) {
 }
 
 function occupiedCells() {
-	return new Set(S.desktopIcons.filter(i => i.col != null).map(i => i.col + ',' + i.row));
+	const taken = new Set(S.desktopIcons.filter(i => i.col != null).map(i => i.col + ',' + i.row));
+	(S.widgets || []).forEach(w => {
+		if (w.col == null || w.row == null) return;
+		const s = widgetSpan(w);
+		for (let r = s.row; r < s.row + s.h; r++)
+			for (let c = s.col; c < s.col + s.w; c++) taken.add(c + ',' + r);
+	});
+	return taken;
+}
+
+// A widget's span on the grid, clamped to the viewport's columns so a
+// wide widget never claims cells past the right edge.
+function widgetSpan(w) {
+	const maxCols = Math.max(1, Math.floor((window.innerWidth - GRID.ox) / GRID.uw));
+	return {
+		col: (w.col == null ? 0 : w.col),
+		row: (w.row == null ? 0 : w.row),
+		w: Math.max(1, Math.min(w.w || 3, maxCols)),
+		h: Math.max(1, w.h || 2),
+	};
+}
+
+// First top-left cell where a w-by-h block fits, row-major.
+function nextFreeSpan(occupied, w, h) {
+	const maxCols = Math.max(1, Math.floor((window.innerWidth - GRID.ox) / GRID.uw));
+	const ww = Math.max(1, Math.min(w, maxCols));
+	const hh = Math.max(1, h);
+	for (let row = 0; row < 100; row++)
+		for (let col = 0; col + ww <= maxCols; col++) {
+			let fits = true;
+			for (let r = row; r < row + hh && fits; r++)
+				for (let c = col; c < col + ww; c++)
+					if (occupied.has(c + ',' + r)) { fits = false; break; }
+			if (fits) return { col, row };
+		}
+	return { col: 0, row: 0 };
+}
+
+// Is a w-by-h span at (col, row) entirely free? Optionally ignores one
+// widget (the one being moved/resized — its old cells free up).
+function spanFree(col, row, w, h, excludeWidgetId) {
+	const maxCols = Math.max(1, Math.floor((window.innerWidth - GRID.ox) / GRID.uw));
+	if (col < 0 || row < 0 || col + w > maxCols) return false;
+	const taken = occupiedCells();
+	if (excludeWidgetId) {
+		const self = (S.widgets || []).find(x => x.id === excludeWidgetId);
+		if (self && self.col != null && self.row != null) {
+			const s = widgetSpan(self);
+			for (let r = s.row; r < s.row + s.h; r++)
+				for (let c = s.col; c < s.col + s.w; c++) taken.delete(c + ',' + r);
+		}
+	}
+	for (let r = row; r < row + h; r++)
+		for (let c = col; c < col + w; c++)
+			if (taken.has(c + ',' + r)) return false;
+	return true;
+}
+
+// The widget (if any) whose span covers one grid cell.
+function widgetCoveringCell(col, row) {
+	return (S.widgets || []).find(w => {
+		if (w.col == null || w.row == null) return false;
+		const s = widgetSpan(w);
+		return col >= s.col && col < s.col + s.w && row >= s.row && row < s.row + s.h;
+	}) || null;
 }
 
 function ensureIconPositions() {
@@ -37,6 +101,21 @@ function ensureIconPositions() {
 			icon.col = col; icon.row = row;
 			occupied.add(col + ',' + row);
 		}
+	});
+}
+
+// Widgets created before grid placement get a cell: first free span of
+// their size, after the icons. (The server backfills this too on boot;
+// this is the safety net for any row that still arrives unplaced.)
+function ensureWidgetPositions() {
+	const occupied = occupiedCells();
+	(S.widgets || []).forEach(w => {
+		if (w.col != null && w.row != null) return;
+		const s = widgetSpan(w);
+		const { col, row } = nextFreeSpan(occupied, s.w, s.h);
+		w.col = col; w.row = row;
+		for (let r = row; r < row + s.h; r++)
+			for (let c = col; c < col + s.w; c++) occupied.add(c + ',' + r);
 	});
 }
 
@@ -89,16 +168,17 @@ async function loadState() {
 			rotation: data.rotation || null,
 			pinRequired: !!data.pin_required,
 			pinLen: data.pin_len || null,
-			// Widgets are the signed-in owner's own HTML embeds; the
-			// server only ever includes them when the viewer IS that
-			// owner, so a public/profile view simply gets none.
-			widgets: (data.widgets || []).map(w => ({ id: w.id, title: w.title, html: w.html, sort: w.sort })),
+			// Widgets are the owner's own HTML embeds (and public ones,
+			// when the viewer isn't the owner). col/row/w/h place each
+			// one on the desktop grid like an icon tile.
+			widgets: (data.widgets || []).map(w => ({ id: w.id, title: w.title, html: w.html, sort: w.sort, is_public: !!w.is_public, col: w.col, row: w.row, w: w.w || 3, h: w.h || 2 })),
 			csrf,
 		};
 	} catch (_) {
 		S = { desktopIcons: [], dock: [], bookmarkSections: [{ blocks: [] }], about: [], widgets: [], branding: null, wallpaper: null, rotation: null, pinRequired: false, pinLen: null, csrf };
 	}
 	ensureIconPositions();
+	ensureWidgetPositions();
 }
 
 // ── Wallpaper ──────────────────────────────────────────────────
